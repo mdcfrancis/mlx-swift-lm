@@ -115,10 +115,30 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         blockSize: Int,
         components: GenerationComponents = .init()
     ) throws {
+        var options = SpeculativeOptions()
+        options.blockSize = blockSize
+        options.adaptiveBlock = false
+        try self.init(
+            input: input, mainModel: mainModel, drafter: drafter, mainCache: mainCache, state: state,
+            parameters: parameters, options: options, components: components)
+    }
+
+    public init(
+        input: LMInput,
+        mainModel: any LanguageModel,
+        drafter: any MTPDrafterModel,
+        mainCache: [KVCache]? = nil,
+        state: LMOutput.State? = nil,
+        parameters: GenerateParameters,
+        options: SpeculativeOptions,
+        components: GenerationComponents = .init()
+    ) throws {
+        let blockSize = options.blockSize
         precondition(
             blockSize >= 2,
             "MTPSpeculativeTokenIterator requires blockSize >= 2 (1 bonus + K-1 drafted)")
         self.incomingState = state
+        self.options = options
 
         let kvCachePlan = try parameters.kvCachePlan()
         let mainCache = try kvCachePlan.validated(
@@ -219,10 +239,10 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     /// cached prefix's hidden states for a drafter that wants them).
     private var incomingState: LMOutput.State?
 
-    // Profiling (MTP_PROFILE=1): per-stage wall time of speculative rounds.
-    private var profileClock = Date()
-    private var profileTimes: [String: Double] = [:]
-    private var profileRounds = 0
+    private let options: SpeculativeOptions
+    private var roundIndex = 0
+    private var stageClock = ContinuousClock.now
+    private var stageTimes: [String: Double] = [:]
 
     mutating func prepare(input: LMInput, prefill: PrefillParameters = .init()) throws {
         processor?.prompt(input.text.tokens)
@@ -436,7 +456,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             && mainCache.allSatisfy { $0.isTrimmable || $0 is MambaCache }
         let round =
             nativeHybridRewind
-            ? nil : mainCacheStorage.beginRound(maximumPositions: numDraft + 1)
+            ? nil : mainCacheStorage.beginRound(maximumPositions: options.verifyRows(for: numDraft + 1))
         guard nativeHybridRewind || round != nil else {
             switchToPassthrough(
                 reason: "main KV cache cannot stage a speculative round; continuing without "
@@ -478,7 +498,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             """
         )
 
-        if Self.profiling { profileLap("between") }
+        stageLap("between")
         let bonusToken = y.tokens
         let draftTokens: MLXArray
         if let statefulDrafter = drafter as? any StatefulMTPDrafterModel,
@@ -510,19 +530,29 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
         // draftTokens shape [B, numDraft] -> flatten to [numDraft].
         let flatDraftTokens = draftTokens.flattened()
-        if Self.profiling { eval(flatDraftTokens); profileLap("draft") }
+        if options.timing { eval(flatDraftTokens) }
+        stageLap("draft")
 
         // Verify pass: main model evaluates [bonus, draft_1, ..., draft_numDraft]
         // in one forward call, emitting state for next round.
         var verifyState = state
         verifyState[mtpEmitFlagKey] = true
         verifyState[mtpTapLayersKey] = drafter.targetTapLayers
-        let verifyTokens = concatenated([bonusToken, flatDraftTokens])
+        // The verify pass may be padded to a width the target's verify
+        // kernels serve; padding rows repeat the last drafted token and are
+        // rolled back with the rejected ones.
+        let verifyRows = options.verifyRows(for: numDraft + 1)
+        let padding = verifyRows - (numDraft + 1)
+        var verifyTokens = concatenated([bonusToken, flatDraftTokens])
+        if padding > 0 {
+            verifyTokens = concatenated([verifyTokens, broadcast(flatDraftTokens[-1], to: [padding])])
+        }
         let verifyInput = LMInput.Text(tokens: verifyTokens)
-        let verifyStart = verifyInput.tokens.dim(0) - (numDraft + 1)
-        // One drafted token: the target checkpoints its recurrent state after
-        // the bonus token. More: it records a tape and replays the kept prefix.
-        let tapedRewind = nativeHybridRewind && numDraft > 1
+        let verifyStart = 0
+        // One drafted token and no padding: the target checkpoints its
+        // recurrent state after the bonus token. More: it records a tape
+        // and replays the kept prefix.
+        let tapedRewind = nativeHybridRewind && verifyRows > 2
         verifyState[mtpCacheCheckpointIndexKey] = (nativeHybridRewind && !tapedRewind) ? 1 : nil
         verifyState[mtpSpeculativeTapeKey] = tapedRewind ? true : nil
         let verifyCache = nativeHybridRewind ? mainCache : round!.caches
@@ -530,7 +560,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             verifyInput[text: .newAxis], cache: verifyCache, state: verifyState)
         let mainLogits = mainResult.logits
         mainState = mainResult.state
-        if Self.profiling { eval(mainLogits); profileLap("verify") }
+        if options.timing { eval(mainLogits) }
+        stageLap("verify")
 
         eval(flatDraftTokens)
         let draftTokensList = flatDraftTokens.asArray(Int.self)
@@ -586,22 +617,25 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 finalToken = bonus
             }
         }
-        if Self.profiling { eval(finalToken!); profileLap("accept") }
+        if options.timing { eval(finalToken!) }
+        stageLap("accept")
         let emittedFinalToken = finalToken!
         committedPendingTokenCount = accepted
 
         proposedCount += numDraft
         acceptedCount += accepted
         lastRoundAccepted = accepted
-        blockSize = Swift.max(
-            2,
-            Swift.min(
-                maximumRoundBlockSize,
-                drafter.nextBlockSize(afterAccepting: accepted, current: blockSize, maximum: maximumRoundBlockSize)))
+        if options.adaptiveBlock {
+            blockSize = Swift.max(
+                2,
+                Swift.min(
+                    maximumRoundBlockSize,
+                    drafter.nextBlockSize(afterAccepting: accepted, current: blockSize, maximum: maximumRoundBlockSize)))
+        }
         telemetry.recordRound(
             drafted: numDraft,
             accepted: accepted,
-            targetVerified: numDraft + 1,
+            targetVerified: verifyRows,
             draftModelCalls: 1
         )
 
@@ -619,9 +653,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 sampler: sampler)
             drafterState = currentDrafterState
         }
-        if Self.profiling { profileLap("commit") }
+        stageLap("commit")
 
-        let rejected = numDraft - accepted
+        // Everything the pass processed beyond the bonus and the accepted
+        // drafts goes: rejected drafts and padding alike.
+        let rejected = verifyRows - 1 - accepted
         let snapshotPlaced: Bool
         if nativeHybridRewind {
             if rejected == 0 {
@@ -659,7 +695,16 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             return
         }
 
-        if Self.profiling { eval(mainCache.flatMap { $0.innerState() }); profileLap("rewind") }
+        if options.timing { eval(mainCache.flatMap { $0.innerState() }) }
+        stageLap("rewind")
+        roundIndex += 1
+        if let observer = options.observer {
+            observer(
+                SpeculativeRoundReport(
+                    round: roundIndex, blockSize: numDraft + 1, drafted: numDraft, accepted: accepted,
+                    verifiedRows: verifyRows, stageMilliseconds: options.timing ? stageTimes : nil))
+            stageTimes.removeAll(keepingCapacity: true)
+        }
 
         // Dynamic cache quantization may convert regular K/V to quantized K/V,
         // at which point the target's emit-hook cannot provide full_attention
@@ -763,23 +808,15 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 }
 
 extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
-    // MARK: Profiling (MTP_PROFILE=1): per-stage wall time of speculative rounds.
-    static let profiling = ProcessInfo.processInfo.environment["MTP_PROFILE"] != nil
-
-    private mutating func profileLap(_ stage: String) {
-        let now = Date()
-        profileTimes[stage, default: 0] += now.timeIntervalSince(profileClock)
-        profileClock = now
-        if stage == "rewind" { profileRounds += 1 }
+    private mutating func stageLap(_ stage: String) {
+        guard options.timing else { return }
+        let now = ContinuousClock.now
+        let d = now - stageClock
+        stageTimes[stage, default: 0] += Double(d.components.seconds) * 1000 + Double(d.components.attoseconds) / 1e15
+        stageClock = now
     }
 
     mutating func finalizeGeneration() {
-        if Self.profiling, profileRounds > 0 {
-            let parts = profileTimes.sorted { $0.value > $1.value }.map {
-                String(format: "%@ %.1f ms", $0.key, $0.value * 1000 / Double(profileRounds))
-            }
-            print("mtp profile: \(profileRounds) rounds, per round: " + parts.joined(separator: ", "))
-        }
         // A fully consumed all-accepted round can still retain the recurrent
         // checkpoint used for early-finalization rollback. Release it even
         // when no committed lookahead remains.
