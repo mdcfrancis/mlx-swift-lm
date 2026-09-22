@@ -643,9 +643,12 @@ public enum Qwen35Language {
                 * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
             if recordTape, let cache {
-                var operands = ["q": qNormed, "k": kNormed, "v": v, "a": a, "b": b, "convInput": convInput]
+                var operands = [
+                    "q": qNormed, "k": kNormed, "v": v, "a": a, "b": b, "convInput": convInput,
+                ]
                 if let mask { operands["mask"] = mask }
-                cache.recordSpeculativeTape(stateBefore: stateBefore, positions: S, operands: operands)
+                cache.recordSpeculativeTape(
+                    stateBefore: stateBefore, positions: S, operands: operands)
             }
 
             let out: MLXArray
@@ -742,7 +745,8 @@ public enum Qwen35Language {
                 : (tape.stateBefore.first ?? nil)
             // Left lazy on purpose: the caller evaluates every layer's
             // restored state in one pass.
-            cache.restoreFromSpeculativeTape(keep: keep, convState: convState, recurrentState: recurrent)
+            cache.restoreFromSpeculativeTape(
+                keep: keep, convState: convState, recurrentState: recurrent)
         }
     }
 
@@ -886,9 +890,27 @@ public enum Qwen35Language {
             cache: [KVCache?]? = nil,
             positionIds: MLXArray? = nil,
             applyFinalNorm: Bool = true,
+            checkpointAfter: Int? = nil
+        ) -> MLXArray {
+            forward(
+                inputs, inputsEmbeds: inputsEmbeds, cache: cache, positionIds: positionIds,
+                applyFinalNorm: applyFinalNorm, checkpointAfter: checkpointAfter,
+                tapLayers: nil, recordTape: false
+            ).hidden
+        }
+
+        /// The forward pass that also returns the concatenated outputs of
+        /// `tapLayers` (decoder layer indices) for every position, and
+        /// records a speculative tape in the recurrent layers when asked.
+        open func forward(
+            _ inputs: MLXArray,
+            inputsEmbeds: MLXArray? = nil,
+            cache: [KVCache?]? = nil,
+            positionIds: MLXArray? = nil,
+            applyFinalNorm: Bool = true,
             checkpointAfter: Int? = nil,
-            tapLayers: [Int]? = nil,
-            recordTape: Bool = false
+            tapLayers: [Int]?,
+            recordTape: Bool
         ) -> (hidden: MLXArray, taps: MLXArray?) {
             var hiddenStates: MLXArray
             if let inputsEmbeds {
@@ -943,7 +965,9 @@ public enum Qwen35Language {
             guard cache.count == layers.count, numTokens > 0 else { return 0 }
             for (index, entry) in cache.enumerated() {
                 if let mamba = entry as? MambaCache {
-                    guard let tape = mamba.speculativeTape, tape.positions >= numTokens else { return 0 }
+                    guard let tape = mamba.speculativeTape, tape.positions >= numTokens else {
+                        return 0
+                    }
                     _ = index
                 } else if !entry.isTrimmable || entry.offset < numTokens {
                     return 0
@@ -1080,7 +1104,7 @@ public enum Qwen35Language {
             }
 
             let emitDrafterState = state[mtpEmitFlagKey] ?? false
-            let (preNormHidden, taps) = model(
+            let (preNormHidden, taps) = model.forward(
                 inputs,
                 inputsEmbeds: inputsEmbeds,
                 cache: cache,

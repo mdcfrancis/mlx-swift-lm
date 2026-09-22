@@ -1654,7 +1654,9 @@ public class MambaCache: ArraysCache {
     /// Record the tape for a verify pass of `positions` tokens. `stateBefore`
     /// is the cache content as the pass found it; the layer calls this before
     /// it advances the cache.
-    public func recordSpeculativeTape(stateBefore: [MLXArray?], positions: Int, operands: [String: MLXArray]) {
+    public func recordSpeculativeTape(
+        stateBefore: [MLXArray?], positions: Int, operands: [String: MLXArray]
+    ) {
         speculativeTape = SpeculativeTape(
             stateBefore: stateBefore, offsetBefore: offset, leftPaddingBefore: leftPadding,
             lengthsBefore: lengths, positions: positions, operands: operands)
@@ -1663,7 +1665,9 @@ public class MambaCache: ArraysCache {
     /// Put the cache back to the state before the taped pass plus `keep`
     /// positions, given the replayed conv and recurrent states (mirrors
     /// ``advance(_:)`` by `keep`).
-    public func restoreFromSpeculativeTape(keep: Int, convState: MLXArray?, recurrentState: MLXArray?) {
+    public func restoreFromSpeculativeTape(
+        keep: Int, convState: MLXArray?, recurrentState: MLXArray?
+    ) {
         guard let tape = speculativeTape else { return }
         cache = [convState, recurrentState]
         offset = tape.offsetBefore

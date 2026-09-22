@@ -342,7 +342,8 @@ final class Qwen35GatedDeltaNet: Module {
             checkpointAfter: checkpointAfter, recordTape: recordTape)
         if let cache {
             if let tape {
-                cache.recordSpeculativeTape(stateBefore: stateBefore, positions: inputs.dim(1), operands: tape)
+                cache.recordSpeculativeTape(
+                    stateBefore: stateBefore, positions: inputs.dim(1), operands: tape)
             }
             cache[0] = newConvState
             cache[1] = newRecState
@@ -382,7 +383,8 @@ final class Qwen35GatedDeltaNet: Module {
             convKernelSize > 1
             ? contiguous(convInput[0..., keep ..< (keep + convKernelSize - 1), 0...])
             : (tape.stateBefore.first ?? nil)
-        cache.restoreFromSpeculativeTape(keep: keep, convState: convState, recurrentState: recurrent)
+        cache.restoreFromSpeculativeTape(
+            keep: keep, convState: convState, recurrentState: recurrent)
     }
 
     /// Zero conv/recurrent state — the shapes `callAsFunction` and
@@ -967,7 +969,10 @@ public class Qwen35TextModelInner: Module {
         applyFinalNorm: Bool,
         checkpointAfter: Int? = nil
     ) -> MLXArray {
-        forward(inputs, cache: cache, applyFinalNorm: applyFinalNorm, checkpointAfter: checkpointAfter, tapLayers: nil, recordTape: false).hidden
+        forward(
+            inputs, cache: cache, applyFinalNorm: applyFinalNorm, checkpointAfter: checkpointAfter,
+            tapLayers: nil, recordTape: false
+        ).hidden
     }
 
     /// `forward` that also returns the concatenated outputs of `tapLayers`
@@ -1025,7 +1030,9 @@ public class Qwen35TextModelInner: Module {
         guard cache.count == layers.count, numTokens > 0 else { return 0 }
         for entry in cache {
             if let mamba = entry as? MambaCache {
-                guard let tape = mamba.speculativeTape, tape.positions >= numTokens else { return 0 }
+                guard let tape = mamba.speculativeTape, tape.positions >= numTokens else {
+                    return 0
+                }
             } else if !entry.isTrimmable || entry.offset < numTokens {
                 return 0
             }

@@ -106,7 +106,8 @@ public struct DFlashDraftConfiguration: Codable, Sendable {
         rmsNormEps = try c.decodeIfPresent(Float.self, forKey: .rmsNormEps) ?? 1e-6
         vocabularySize = try c.decode(Int.self, forKey: .vocabularySize)
         let parameters = try c.decodeIfPresent(RopeParameters.self, forKey: .ropeParameters)
-        ropeTheta = try c.decodeIfPresent(Float.self, forKey: .ropeTheta) ?? parameters?.ropeTheta ?? 10000
+        ropeTheta =
+            try c.decodeIfPresent(Float.self, forKey: .ropeTheta) ?? parameters?.ropeTheta ?? 10000
         slidingWindow = try c.decodeIfPresent(Int.self, forKey: .slidingWindow)
         layerTypes = try c.decodeIfPresent([String].self, forKey: .layerTypes)
         isCausal = try c.decodeIfPresent(Bool.self, forKey: .isCausal)
@@ -130,7 +131,9 @@ public struct DFlashDraftConfiguration: Codable, Sendable {
 
     /// True when `config.json` describes a DFlash draft (any base model type).
     public static func describes(_ data: Data) -> Bool {
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
         return root["dflash_config"] is [String: Any]
     }
 
@@ -198,7 +201,8 @@ public final class DFlashContextCache: BaseKVCache {
             let sink = 0 ..< sinkSize
             let window = (total - windowSize) ..< total
             self.keys = concatenated([keys[0..., 0..., sink], keys[0..., 0..., window]], axis: 2)
-            self.values = concatenated([values[0..., 0..., sink], values[0..., 0..., window]], axis: 2)
+            self.values = concatenated(
+                [values[0..., 0..., sink], values[0..., 0..., window]], axis: 2)
             positions = Array(positions[sink]) + Array(positions[window])
         }
     }
@@ -401,11 +405,17 @@ final class DFlashDecoderLayer: Module {
     init(_ config: DFlashDraftConfiguration, layer: Int) {
         _attention.wrappedValue = DFlashAttention(config, layer: layer)
         _mlp.wrappedValue = DFlashMLP(config)
-        _inputLayerNorm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        _postAttentionLayerNorm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        if config.hasConvolutions, let kernel = config.dflash.convKernelSize, let group = config.dflash.convGroupSize {
-            _attentionConv.wrappedValue = DFlashGroupedDynamicConv(hiddenSize: config.hiddenSize, kernelSize: kernel, groupSize: group)
-            _mlpConv.wrappedValue = DFlashGroupedDynamicConv(hiddenSize: config.hiddenSize, kernelSize: kernel, groupSize: group)
+        _inputLayerNorm.wrappedValue = RMSNorm(
+            dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        _postAttentionLayerNorm.wrappedValue = RMSNorm(
+            dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        if config.hasConvolutions, let kernel = config.dflash.convKernelSize,
+            let group = config.dflash.convGroupSize
+        {
+            _attentionConv.wrappedValue = DFlashGroupedDynamicConv(
+                hiddenSize: config.hiddenSize, kernelSize: kernel, groupSize: group)
+            _mlpConv.wrappedValue = DFlashGroupedDynamicConv(
+                hiddenSize: config.hiddenSize, kernelSize: kernel, groupSize: group)
         }
         super.init()
     }
@@ -414,7 +424,10 @@ final class DFlashDecoderLayer: Module {
         var h = x
         if let attentionConv, let mlpConv {
             let (normed, dynamic) = attentionConv.prepare(inputLayerNorm(h))
-            h = h + attentionConv.finish(attention(normed, cache: cache, queryOffset: queryOffset), dynamic: dynamic)
+            h =
+                h
+                + attentionConv.finish(
+                    attention(normed, cache: cache, queryOffset: queryOffset), dynamic: dynamic)
             let (normed2, dynamic2) = mlpConv.prepare(postAttentionLayerNorm(h))
             return h + mlpConv.finish(mlp(normed2), dynamic: dynamic2)
         }
@@ -434,8 +447,10 @@ final class DFlashCandidateSelector: Module {
 
     init(_ config: DFlashDraftConfiguration, rank: Int, topK: Int) {
         self.topK = topK
-        _predecessorCodebook.wrappedValue = Embedding(embeddingCount: config.vocabularySize, dimensions: rank)
-        _successorCodebook.wrappedValue = Embedding(embeddingCount: config.vocabularySize, dimensions: rank)
+        _predecessorCodebook.wrappedValue = Embedding(
+            embeddingCount: config.vocabularySize, dimensions: rank)
+        _successorCodebook.wrappedValue = Embedding(
+            embeddingCount: config.vocabularySize, dimensions: rank)
         _hiddenProjection.wrappedValue = Linear(config.hiddenSize, rank, bias: false)
         super.init()
     }
@@ -445,18 +460,18 @@ final class DFlashCandidateSelector: Module {
     func select(hidden: MLXArray, logits: MLXArray, anchor: MLXArray) -> MLXArray {
         let vocabulary = logits.dim(-1)
         let k = min(topK, vocabulary)
-        let candidates = argPartition(logits, kth: vocabulary - k, axis: -1)[.ellipsis, (vocabulary - k)...]
+        let candidates = argPartition(logits, kth: vocabulary - k, axis: -1)[
+            .ellipsis, (vocabulary - k)...]
         let unary = takeAlong(logits, candidates, axis: -1).asType(.float32)
         let projected = hiddenProjection(hidden)
         var predecessor = anchor.reshaped(-1)
         var path: [MLXArray] = []
         for position in 0 ..< hidden.dim(1) {
             let slot = candidates[0..., position]
-            let edges = (
-                predecessorCodebook(predecessor)[0..., .newAxis, 0...]
+            let edges =
+                (predecessorCodebook(predecessor)[0..., .newAxis, 0...]
                 * projected[0..., position, .newAxis, 0...]
-                * successorCodebook(slot)
-            ).sum(axis: -1).asType(.float32)
+                * successorCodebook(slot)).sum(axis: -1).asType(.float32)
             let scores = unary[0..., position] + edges
             let selected = argMax(scores, axis: -1)
             predecessor = takeAlong(slot, selected[0..., .newAxis], axis: -1)[0..., 0]
@@ -503,12 +518,19 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel {
 
     public init(_ configuration: DFlashDraftConfiguration) {
         self.configuration = configuration
-        _layers.wrappedValue = (0 ..< configuration.hiddenLayers).map { DFlashDecoderLayer(configuration, layer: $0) }
-        _norm.wrappedValue = RMSNorm(dimensions: configuration.hiddenSize, eps: configuration.rmsNormEps)
+        _layers.wrappedValue = (0 ..< configuration.hiddenLayers).map {
+            DFlashDecoderLayer(configuration, layer: $0)
+        }
+        _norm.wrappedValue = RMSNorm(
+            dimensions: configuration.hiddenSize, eps: configuration.rmsNormEps)
         _fc.wrappedValue = Linear(
-            configuration.dflash.targetLayerIds.count * configuration.hiddenSize, configuration.hiddenSize, bias: false)
-        _hiddenNorm.wrappedValue = RMSNorm(dimensions: configuration.hiddenSize, eps: configuration.rmsNormEps)
-        if configuration.hasSelector, let rank = configuration.dflash.selectorRank, let topK = configuration.dflash.selectorTopK {
+            configuration.dflash.targetLayerIds.count * configuration.hiddenSize,
+            configuration.hiddenSize, bias: false)
+        _hiddenNorm.wrappedValue = RMSNorm(
+            dimensions: configuration.hiddenSize, eps: configuration.rmsNormEps)
+        if configuration.hasSelector, let rank = configuration.dflash.selectorRank,
+            let topK = configuration.dflash.selectorTopK
+        {
             _selector.wrappedValue = DFlashCandidateSelector(configuration, rank: rank, topK: topK)
         }
         super.init()
@@ -540,7 +562,8 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel {
             let context = projectContext(targetHidden[0..., span, 0...])
             for (layer, entry) in zip(layers, caches) {
                 guard let cache = entry as? DFlashContextCache else { continue }
-                let (k, v) = layer.attention.contextKeysValues(context, start: start + span.lowerBound)
+                let (k, v) = layer.attention.contextKeysValues(
+                    context, start: start + span.lowerBound)
                 cache.append(keys: k, values: v, start: start + span.lowerBound)
             }
         }
@@ -548,9 +571,13 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel {
     }
 
     /// Draft `blockSize - 1` tokens after `anchor` `[B, 1]`.
-    func draft(anchor: MLXArray, target: any DFlashTargetModel, caches: [KVCache], queryOffset: Int, blockSize: Int) -> MLXArray {
+    func draft(
+        anchor: MLXArray, target: any DFlashTargetModel, caches: [KVCache], queryOffset: Int,
+        blockSize: Int
+    ) -> MLXArray {
         let B = anchor.dim(0)
-        let masks = MLXArray.full([B, blockSize - 1], values: MLXArray(Int32(configuration.dflash.maskTokenId)))
+        let masks = MLXArray.full(
+            [B, blockSize - 1], values: MLXArray(Int32(configuration.dflash.maskTokenId)))
         let tokens = concatenated([anchor.asType(.int32), masks], axis: 1)
         var h = target.dflashTokenEmbedding(tokens)
         let scale = target.dflashEmbeddingScale * (configuration.dflash.inputEmbeddingScale ?? 1)
@@ -566,18 +593,21 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel {
         return argMax(logits, axis: -1)
     }
 
-    // MARK: Debug hooks
+    // MARK: Testing hooks
 
     /// The projected draft context for target taps `[B, n, taps × H]`.
-    public func debugProjectContext(_ targetHidden: MLXArray) -> MLXArray {
+    @_spi(Testing) public func debugProjectContext(_ targetHidden: MLXArray) -> MLXArray {
         projectContext(targetHidden)
     }
 
     /// One block forward from fresh caches: `context` `[B, n, H]` at
     /// positions `0 ..< n`, `noiseEmbedding` `[B, block, H]` at positions
     /// `n ..< n + block`. Returns the normalised block hidden states.
-    public func debugForward(context: MLXArray, noiseEmbedding: MLXArray) -> MLXArray {
-        let caches = layers.map { _ in DFlashContextCache(sinkSize: sinkSize, windowSize: windowSize) }
+    @_spi(Testing) public func debugForward(context: MLXArray, noiseEmbedding: MLXArray) -> MLXArray
+    {
+        let caches = layers.map { _ in
+            DFlashContextCache(sinkSize: sinkSize, windowSize: windowSize)
+        }
         for (layer, cache) in zip(layers, caches) {
             let (k, v) = layer.attention.contextKeysValues(context, start: 0)
             cache.append(keys: k, values: v, start: 0)
@@ -590,18 +620,23 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel {
     }
 
     /// Selector choice for debugging: `hidden` `[B, P, H]`, `logits` `[B, P, V]`, `anchor` `[B]`.
-    public func debugSelect(hidden: MLXArray, logits: MLXArray, anchor: MLXArray) -> MLXArray? {
+    @_spi(Testing) public func debugSelect(hidden: MLXArray, logits: MLXArray, anchor: MLXArray)
+        -> MLXArray?
+    {
         selector?.select(hidden: hidden, logits: logits, anchor: anchor)
     }
 
     // MARK: StatefulMTPDrafterModel
 
     public func makeState(parameters: GenerateParameters?) -> MTPDrafterState {
-        MTPDrafterState(cache: layers.map { _ in DFlashContextCache(sinkSize: sinkSize, windowSize: windowSize) })
+        MTPDrafterState(
+            cache: layers.map { _ in DFlashContextCache(sinkSize: sinkSize, windowSize: windowSize)
+            })
     }
 
     public func prepareDrafterState(
-        target: any LanguageModel, promptTokens: MLXArray, targetHidden: MLXArray, firstBonus: MLXArray,
+        target: any LanguageModel, promptTokens: MLXArray, targetHidden: MLXArray,
+        firstBonus: MLXArray,
         positionDeltas: MLXArray?, state: inout MTPDrafterState, sampler: any LogitSampler
     ) {
         // Everything the target has seen so far (a cached prefix's hidden
@@ -613,38 +648,46 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel {
     }
 
     public func draftBlock(
-        target: any LanguageModel, lastToken: MLXArray, lastHidden: MLXArray, sharedKV: [String: (MLXArray, MLXArray)],
-        positionDeltas: MLXArray?, queryOffset: Int, blockSize: Int, state: inout MTPDrafterState, sampler: any LogitSampler
+        target: any LanguageModel, lastToken: MLXArray, lastHidden: MLXArray,
+        sharedKV: [String: (MLXArray, MLXArray)],
+        positionDeltas: MLXArray?, queryOffset: Int, blockSize: Int, state: inout MTPDrafterState,
+        sampler: any LogitSampler
     ) -> MLXArray {
         guard let target = target as? any DFlashTargetModel else {
             fatalError("DFlashDraftModel needs a DFlashTargetModel target, got \(type(of: target))")
         }
         let anchor = lastToken.ndim == 1 ? lastToken.reshaped(lastToken.dim(0), 1) : lastToken
         let proposed = draft(
-            anchor: anchor, target: target, caches: state.cache, queryOffset: state.nextPosition, blockSize: blockSize)
+            anchor: anchor, target: target, caches: state.cache, queryOffset: state.nextPosition,
+            blockSize: blockSize)
         state.proposalAppended = blockSize - 1
         return proposed
     }
 
     public func draftBlock(
-        target: any LanguageModel, lastToken: MLXArray, lastHidden: MLXArray, sharedKV: [String: (MLXArray, MLXArray)],
+        target: any LanguageModel, lastToken: MLXArray, lastHidden: MLXArray,
+        sharedKV: [String: (MLXArray, MLXArray)],
         positionDeltas: MLXArray?, queryOffset: Int, blockSize: Int, sampler: any LogitSampler
     ) -> MLXArray {
         var state = makeState(parameters: nil)
         state.nextPosition = queryOffset
         return draftBlock(
             target: target, lastToken: lastToken, lastHidden: lastHidden, sharedKV: sharedKV,
-            positionDeltas: positionDeltas, queryOffset: queryOffset, blockSize: blockSize, state: &state, sampler: sampler)
+            positionDeltas: positionDeltas, queryOffset: queryOffset, blockSize: blockSize,
+            state: &state, sampler: sampler)
     }
 
     public func commitDrafterState(
-        target: any LanguageModel, targetHidden: MLXArray, draftTokens: MLXArray, acceptedCount: Int,
-        finalToken: MLXArray, positionDeltas: MLXArray?, state: inout MTPDrafterState, sampler: any LogitSampler
+        target: any LanguageModel, targetHidden: MLXArray, draftTokens: MLXArray,
+        acceptedCount: Int,
+        finalToken: MLXArray, positionDeltas: MLXArray?, state: inout MTPDrafterState,
+        sampler: any LogitSampler
     ) {
         // The verify pass covered the bonus token and the drafted ones; the
         // bonus and the accepted drafts are now context.
         let committed = min(acceptedCount + 1, targetHidden.dim(1))
-        appendContext(targetHidden[0..., ..<committed, 0...], start: state.nextPosition, caches: state.cache)
+        appendContext(
+            targetHidden[0..., ..<committed, 0...], start: state.nextPosition, caches: state.cache)
         state.nextPosition += committed
         state.proposalAppended = 0
     }
@@ -654,13 +697,16 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel {
 /// model types their checkpoints declare (the presence of `dflash_config`
 /// tells them apart from an MTP head of the same type).
 public enum DFlashDrafterRegistration {
-    public static func register(modelTypes: [String] = ["qwen3", "qwen3_5", "gemma4", "gemma4_text", "llama"]) async {
+    public static func register(
+        modelTypes: [String] = ["qwen3", "qwen3_5", "gemma4", "gemma4_text", "llama"]
+    ) async {
         for type in modelTypes {
             await MTPDrafterTypeRegistry.shared.registerModelType(
                 type,
                 matches: { DFlashDraftConfiguration.describes($0) },
                 creator: { data in
-                    DFlashDraftModel(try JSONDecoder.json5().decode(DFlashDraftConfiguration.self, from: data))
+                    DFlashDraftModel(
+                        try JSONDecoder.json5().decode(DFlashDraftConfiguration.self, from: data))
                 })
         }
     }

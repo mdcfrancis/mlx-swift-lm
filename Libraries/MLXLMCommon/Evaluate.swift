@@ -2109,7 +2109,8 @@ public func generate(
     options.adaptiveBlock = false
     return try generate(
         input: input, cache: cache, state: state, parameters: parameters, context: context,
-        mtpDrafter: mtpDrafter, options: options, components: components, wiredMemoryTicket: wiredMemoryTicket)
+        mtpDrafter: mtpDrafter, options: options, components: components,
+        wiredMemoryTicket: wiredMemoryTicket, tools: tools)
 }
 
 /// The MTP-drafter variant above with the round policy spelled out in
@@ -2123,7 +2124,8 @@ public func generate(
     mtpDrafter: any MTPDrafterModel,
     options: SpeculativeOptions,
     components: GenerationComponents = .init(),
-    wiredMemoryTicket: WiredMemoryTicket? = nil
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    tools: [[String: any Sendable]]? = nil
 ) throws -> AsyncStream<Generation> {
     let iterator = try MTPSpeculativeTokenIterator(
         input: input,
@@ -2182,7 +2184,8 @@ public func generateTokens(
     options.adaptiveBlock = false
     return try generateTokens(
         input: input, cache: cache, state: state, parameters: parameters, context: context,
-        mtpDrafter: mtpDrafter, options: options, components: components, wiredMemoryTicket: wiredMemoryTicket)
+        mtpDrafter: mtpDrafter, options: options, components: components,
+        wiredMemoryTicket: wiredMemoryTicket)
 }
 
 /// The MTP-drafter variant above with the round policy spelled out in

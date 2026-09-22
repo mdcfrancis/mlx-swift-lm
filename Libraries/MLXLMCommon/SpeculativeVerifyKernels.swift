@@ -30,12 +30,17 @@ public struct VerifyKernelOptions: Sendable {
 public enum SpeculativeVerifyKernels {
     /// The 4-row kernel runs on any Apple GPU; the 16-row kernel needs the
     /// tensor units of the M5 generation and macOS 26.2 or later.
-    public static var isAvailable: Bool { MLX.GPU.deviceInfo().architecture.lowercased().hasPrefix("applegpu") }
+    public static var isAvailable: Bool {
+        MLX.GPU.deviceInfo().architecture.lowercased().hasPrefix("applegpu")
+    }
 
     public static var supportsTensorUnitKernel: Bool {
-        guard MLX.GPU.deviceInfo().architecture.lowercased().hasPrefix("applegpu_g17") else { return false }
+        guard MLX.GPU.deviceInfo().architecture.lowercased().hasPrefix("applegpu_g17") else {
+            return false
+        }
         let version = ProcessInfo.processInfo.operatingSystemVersion
-        return version.majorVersion > 26 || (version.majorVersion == 26 && version.minorVersion >= 2)
+        return version.majorVersion > 26
+            || (version.majorVersion == 26 && version.minorVersion >= 2)
     }
 
     /// Replace every eligible ``QuantizedLinear`` under `model` with a
@@ -94,7 +99,9 @@ open class VerifyQuantizedLinear: QuantizedLinear {
         outputSize = N
         var rows: [Int] = []
         if options.rows.contains(4) { rows.append(4) }
-        if options.rows.contains(16), SpeculativeVerifyKernels.supportsTensorUnitKernel, K % 256 == 0, N % 32 == 0 {
+        if options.rows.contains(16), SpeculativeVerifyKernels.supportsTensorUnitKernel,
+            K % 256 == 0, N % 32 == 0
+        {
             rows.append(16)
         }
         servedRows = rows
@@ -107,25 +114,33 @@ open class VerifyQuantizedLinear: QuantizedLinear {
 
     open override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let rows = x.size / inputSize
-        guard servedRows.contains(rows), x.dtype == .bfloat16 || x.dtype == .float16, let biases else {
+        guard servedRows.contains(rows), x.dtype == .bfloat16 || x.dtype == .float16, let biases
+        else {
             return super.callAsFunction(x)
         }
         let x2 = x.reshaped(rows, inputSize)
         var y: MLXArray
         if rows == 16 {
-            let kernel = VerifyKernelCache.shared.tensorUnitKernel(k: inputSize, groupSize: groupSize, dtype: x.dtype)
-            y = kernel(
-                [x2, weight, scales, biases, MLXArray(Int32(outputSize))],
-                template: [("T", x.dtype), ("KCONST", inputSize)],
-                grid: (256, outputSize / 32, 1), threadGroup: (256, 1, 1),
-                outputShapes: [[16, outputSize]], outputDTypes: [x.dtype])[0]
+            let kernel = VerifyKernelCache.shared.tensorUnitKernel(
+                k: inputSize, groupSize: groupSize, dtype: x.dtype)
+            y =
+                kernel(
+                    [x2, weight, scales, biases, MLXArray(Int32(outputSize))],
+                    template: [("T", x.dtype), ("KCONST", inputSize)],
+                    grid: (256, outputSize / 32, 1), threadGroup: (256, 1, 1),
+                    outputShapes: [[16, outputSize]], outputDTypes: [x.dtype])[0]
         } else {
-            let kernel = VerifyKernelCache.shared.splitKKernel(groupSize: groupSize, dtype: x.dtype, kParts: kParts)
-            y = kernel(
-                [x2, weight, scales, biases, MLXArray(Int32(inputSize)), MLXArray(Int32(outputSize))],
-                template: [("T", x.dtype)],
-                grid: (32 * kParts, outputSize / 4, 1), threadGroup: (32 * kParts, 1, 1),
-                outputShapes: [[4, outputSize]], outputDTypes: [x.dtype])[0]
+            let kernel = VerifyKernelCache.shared.splitKKernel(
+                groupSize: groupSize, dtype: x.dtype, kParts: kParts)
+            y =
+                kernel(
+                    [
+                        x2, weight, scales, biases, MLXArray(Int32(inputSize)),
+                        MLXArray(Int32(outputSize)),
+                    ],
+                    template: [("T", x.dtype)],
+                    grid: (32 * kParts, outputSize / 4, 1), threadGroup: (32 * kParts, 1, 1),
+                    outputShapes: [[4, outputSize]], outputDTypes: [x.dtype])[0]
         }
         y = y.reshaped(Array(x.shape.dropLast()) + [outputSize])
         if let bias { y = y + bias }

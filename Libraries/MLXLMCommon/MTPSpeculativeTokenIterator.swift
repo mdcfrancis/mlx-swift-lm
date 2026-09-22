@@ -119,7 +119,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         options.blockSize = blockSize
         options.adaptiveBlock = false
         try self.init(
-            input: input, mainModel: mainModel, drafter: drafter, mainCache: mainCache, state: state,
+            input: input, mainModel: mainModel, drafter: drafter, mainCache: mainCache,
+            state: state,
             parameters: parameters, options: options, components: components)
     }
 
@@ -249,7 +250,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let inputLength = input.text.cacheSequenceLength
 
         var prefillState = incomingState ?? LMOutput.State()
-        let prefixHidden = drafter.consumesFullContextHidden ? incomingState?[mtpLastHiddenStatesKey] : nil
+        let prefixHidden =
+            drafter.consumesFullContextHidden ? incomingState?[mtpLastHiddenStatesKey] : nil
         prefillState[mtpLastHiddenStatesKey] = nil
         prefillState[mtpEmitFlagKey] = true
         prefillState[mtpTapLayersKey] = drafter.targetTapLayers
@@ -371,7 +373,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         if let prefixHidden, let promptHidden = mainState?[mtpLastHiddenStatesKey],
             promptHidden.dim(1) == input.text.tokens.dim(-1)
         {
-            mainState?[mtpLastHiddenStatesKey] = concatenated([prefixHidden, promptHidden], axis: 1)
+            mainState?[mtpLastHiddenStatesKey] = concatenated(
+                [prefixHidden, promptHidden], axis: 1)
         }
 
         if drafter.requiresPromptPrefill,
@@ -456,7 +459,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             && mainCache.allSatisfy { $0.isTrimmable || $0 is MambaCache }
         let round =
             nativeHybridRewind
-            ? nil : mainCacheStorage.beginRound(maximumPositions: options.verifyRows(for: numDraft + 1))
+            ? nil
+            : mainCacheStorage.beginRound(maximumPositions: options.verifyRows(for: numDraft + 1))
         guard nativeHybridRewind || round != nil else {
             switchToPassthrough(
                 reason: "main KV cache cannot stage a speculative round; continuing without "
@@ -545,7 +549,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let padding = verifyRows - (numDraft + 1)
         var verifyTokens = concatenated([bonusToken, flatDraftTokens])
         if padding > 0 {
-            verifyTokens = concatenated([verifyTokens, broadcast(flatDraftTokens[-1], to: [padding])])
+            verifyTokens = concatenated([
+                verifyTokens, broadcast(flatDraftTokens[-1], to: [padding]),
+            ])
         }
         let verifyInput = LMInput.Text(tokens: verifyTokens)
         let verifyStart = 0
@@ -630,7 +636,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 2,
                 Swift.min(
                     maximumRoundBlockSize,
-                    drafter.nextBlockSize(afterAccepting: accepted, current: blockSize, maximum: maximumRoundBlockSize)))
+                    drafter.nextBlockSize(
+                        afterAccepting: accepted, current: blockSize, maximum: maximumRoundBlockSize
+                    )))
         }
         telemetry.recordRound(
             drafted: numDraft,
@@ -701,7 +709,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         if let observer = options.observer {
             observer(
                 SpeculativeRoundReport(
-                    round: roundIndex, blockSize: numDraft + 1, drafted: numDraft, accepted: accepted,
+                    round: roundIndex, blockSize: numDraft + 1, drafted: numDraft,
+                    accepted: accepted,
                     verifiedRows: verifyRows, stageMilliseconds: options.timing ? stageTimes : nil))
             stageTimes.removeAll(keepingCapacity: true)
         }
@@ -812,7 +821,8 @@ extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
         guard options.timing else { return }
         let now = ContinuousClock.now
         let d = now - stageClock
-        stageTimes[stage, default: 0] += Double(d.components.seconds) * 1000 + Double(d.components.attoseconds) / 1e15
+        stageTimes[stage, default: 0] +=
+            Double(d.components.seconds) * 1000 + Double(d.components.attoseconds) / 1e15
         stageClock = now
     }
 

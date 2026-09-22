@@ -106,7 +106,9 @@ public protocol MTPDrafterModel: BaseLanguageModel {
 extension MTPDrafterModel {
     public var targetTapLayers: [Int]? { nil }
     public var consumesFullContextHidden: Bool { false }
-    public func nextBlockSize(afterAccepting accepted: Int, current: Int, maximum: Int) -> Int { current }
+    public func nextBlockSize(afterAccepting accepted: Int, current: Int, maximum: Int) -> Int {
+        current
+    }
     public var maximumBlockSize: Int? { nil }
     public var requiresSharedTargetKV: Bool { true }
     public var requiresPromptPrefill: Bool { false }
@@ -349,7 +351,8 @@ public struct SpeculativeOptions: Sendable {
 
     /// The width a verify pass of `rows` tokens runs at under this policy.
     public func verifyRows(for rows: Int) -> Int {
-        guard let width = verifyRowMultiples.sorted().first(where: { $0 >= rows }), rows * 2 > width else { return rows }
+        guard let width = verifyRowMultiples.sorted().first(where: { $0 >= rows }), rows * 2 > width
+        else { return rows }
         return width
     }
     /// Called after every round with what happened in it.

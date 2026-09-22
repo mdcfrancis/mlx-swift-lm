@@ -45,13 +45,16 @@ extension LLMModel {
             var last: LMOutput?
             try withPreparedCache(cache, lengths: y.sequenceLengths) {
                 let processed = try prefill.forEachChunk(total: total) { range in
-                    let output = self(y[.newAxis, range], cache: cache.isEmpty ? nil : cache, state: state)
+                    let output = self(
+                        y[.newAxis, range], cache: cache.isEmpty ? nil : cache, state: state)
                     if let hidden = output.state?[mtpLastHiddenStatesKey] { emitted.append(hidden) }
                     last = output
                     asyncEval(cache)
                 }
                 if processed < total {
-                    let output = self(y[.newAxis, processed ..< total], cache: cache.isEmpty ? nil : cache, state: state)
+                    let output = self(
+                        y[.newAxis, processed ..< total], cache: cache.isEmpty ? nil : cache,
+                        state: state)
                     if let hidden = output.state?[mtpLastHiddenStatesKey] { emitted.append(hidden) }
                     last = output
                 }
@@ -60,7 +63,8 @@ extension LLMModel {
             guard let last else { return .tokens(y) }
             var outState = last.state ?? LMOutput.State()
             if !emitted.isEmpty {
-                outState[mtpLastHiddenStatesKey] = emitted.count == 1 ? emitted[0] : concatenated(emitted, axis: 1)
+                outState[mtpLastHiddenStatesKey] =
+                    emitted.count == 1 ? emitted[0] : concatenated(emitted, axis: 1)
             }
             return .logits(LMOutput(logits: last.logits, state: outState))
         }
