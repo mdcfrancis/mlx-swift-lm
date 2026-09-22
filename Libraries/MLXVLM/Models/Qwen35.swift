@@ -1409,7 +1409,10 @@ public class Qwen35: Module, VLMModel {
         MLXArray]
     {
         if metadata["format"]?.lowercased() == "mlx" {
-            return weights
+            // Already in this model's layout. A conversion that kept the
+            // MTP head (its tensors live under `language_model.mtp.`) is
+            // served by the drafter, not this model.
+            return weights.filter { !$0.key.contains("mtp.") }
         }
         return sanitize(weights: weights)
     }
