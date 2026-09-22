@@ -26,6 +26,12 @@ import MLXNN
 /// instance. Drafters that need their own per-stream state additionally
 /// conform to ``StatefulMTPDrafterModel``.
 public protocol MTPDrafterModel: BaseLanguageModel {
+    /// Decoder-layer outputs (0-based layer indices) the drafter conditions
+    /// on. When set, the target publishes their concatenation for every
+    /// position under ``mtpLastHiddenStatesKey`` instead of its final
+    /// normalised state (DFlash-style drafters); nil keeps the final state.
+    var targetTapLayers: [Int]? { get }
+
     /// Largest total verification block the drafter can produce efficiently.
     /// `nil` means the caller may choose any block size.
     var maximumBlockSize: Int? { get }
@@ -85,6 +91,7 @@ public protocol MTPDrafterModel: BaseLanguageModel {
 }
 
 extension MTPDrafterModel {
+    public var targetTapLayers: [Int]? { nil }
     public var maximumBlockSize: Int? { nil }
     public var requiresSharedTargetKV: Bool { true }
     public var requiresPromptPrefill: Bool { false }
@@ -98,6 +105,19 @@ extension MTPDrafterModel {
 /// select an in-place path whose recurrent checkpoint is too shallow.
 public protocol SpeculativeCacheRewindModel {
     var maximumNativeTargetCacheRewind: Int { get }
+
+    /// Rewind the last `numTokens` positions of a hybrid cache after a
+    /// speculative verify pass that recorded a tape (``mtpSpeculativeTapeKey``).
+    /// Attention entries trim; recurrent entries are restored to the state
+    /// before the pass and the kept positions replayed. Returns the number of
+    /// positions rewound; the default handles the one-token checkpoint only.
+    func rewindSpeculativeCache(_ cache: [KVCache], numTokens: Int) -> Int
+}
+
+extension SpeculativeCacheRewindModel {
+    public func rewindSpeculativeCache(_ cache: [KVCache], numTokens: Int) -> Int {
+        rewindSpeculativePromptCache(cache, numTokens: numTokens)
+    }
 }
 
 /// Per-stream state for MTP drafters that need their own transient storage.
@@ -296,6 +316,15 @@ public let mtpPositionDeltasKey =
 /// ``mtpLastHiddenStatesKey`` and ``mtpSharedKVStatesKey``. An absent key
 /// reads as `false` (no emit), so non-MTP callers are unaffected.
 public let mtpEmitFlagKey = LMOutput.Key<Bool>("mtp.emitDrafterState")
+
+/// Iterator asks the target which decoder-layer outputs to publish under
+/// ``mtpLastHiddenStatesKey`` (see ``MTPDrafterModel/targetTapLayers``).
+public let mtpTapLayersKey = LMOutput.Key<[Int]>("mtp.tapLayers")
+
+/// Iterator asks the target to record, for this call, what a recurrent
+/// layer needs to restore any prefix of the call's positions afterwards
+/// (``SpeculativeCacheRewindModel/rewindSpeculativeCache(_:numTokens:)``).
+public let mtpSpeculativeTapeKey = LMOutput.Key<Bool>("mtp.recordSpeculativeTape")
 
 /// Requests a recurrent-cache checkpoint after this many verification input
 /// tokens. Hybrid Qwen models use `1` for MTP-1 so a rejected draft restores
