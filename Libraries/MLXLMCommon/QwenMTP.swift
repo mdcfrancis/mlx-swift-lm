@@ -10,7 +10,16 @@ package func qwenMTPSanitizeWeights(
     numExperts: Int,
     shiftNormWeights: Bool
 ) -> [String: MLXArray] {
-    var sanitized = weights.filter { key, _ in key.hasPrefix("mtp.") }
+    // The head's tensors sit at `mtp.` in a Hugging Face checkpoint and
+    // under the language model (`language_model.mtp.` after an mlx-vlm
+    // conversion, `model.mtp.` in some text checkpoints) otherwise.
+    var sanitized = [String: MLXArray]()
+    for (key, value) in weights {
+        guard let range = key.range(of: "mtp."),
+            range.lowerBound == key.startIndex || key[key.index(before: range.lowerBound)] == "."
+        else { continue }
+        sanitized[String(key[range.lowerBound...])] = value
+    }
 
     for layer in 0 ..< max(mtpNumHiddenLayers, 1) {
         let prefix = "mtp.layers.\(layer).mlp"
