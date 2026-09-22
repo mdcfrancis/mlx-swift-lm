@@ -216,6 +216,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
         var prefillState = LMOutput.State()
         prefillState[mtpEmitFlagKey] = true
+        prefillState[mtpTapLayersKey] = drafter.targetTapLayers
         // Note: the drafter is primed via an explicit follow-up forward call
         // after prefill (one position, the bonus token) rather than by
         // passing `prefillState` into `prepare` — the emit flag is meant for
@@ -295,6 +296,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             {
                 var primeState = mainState ?? prefillState
                 primeState[mtpEmitFlagKey] = true
+                primeState[mtpTapLayersKey] = drafter.targetTapLayers
                 let primed = mainModel(y[text: .newAxis], cache: mainCache, state: primeState)
                 mainCacheStorage.commitProcessedTokens(y.cacheSequenceLength)
                 mainState = primed.state
@@ -488,10 +490,15 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         // in one forward call, emitting state for next round.
         var verifyState = state
         verifyState[mtpEmitFlagKey] = true
+        verifyState[mtpTapLayersKey] = drafter.targetTapLayers
         let verifyTokens = concatenated([bonusToken, flatDraftTokens])
         let verifyInput = LMInput.Text(tokens: verifyTokens)
         let verifyStart = verifyInput.tokens.dim(0) - (numDraft + 1)
-        verifyState[mtpCacheCheckpointIndexKey] = nativeHybridRewind ? 1 : nil
+        // One drafted token: the target checkpoints its recurrent state after
+        // the bonus token. More: it records a tape and replays the kept prefix.
+        let tapedRewind = nativeHybridRewind && numDraft > 1
+        verifyState[mtpCacheCheckpointIndexKey] = (nativeHybridRewind && !tapedRewind) ? 1 : nil
+        verifyState[mtpSpeculativeTapeKey] = tapedRewind ? true : nil
         let verifyCache = nativeHybridRewind ? mainCache : round!.caches
         let mainResult = mainModel(
             verifyInput[text: .newAxis], cache: verifyCache, state: verifyState)
@@ -563,8 +570,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             if rejected == 0 {
                 mainCacheStorage.commitProcessedTokens(verifyInput.cacheSequenceLength)
             } else {
-                let rewound = rewindSpeculativePromptCache(
-                    mainCache, numTokens: rejected)
+                let rewound =
+                    tapedRewind
+                    ? ((mainModel as? any SpeculativeCacheRewindModel)?
+                        .rewindSpeculativeCache(mainCache, numTokens: rejected) ?? 0)
+                    : rewindSpeculativePromptCache(mainCache, numTokens: rejected)
                 precondition(
                     rewound == rejected,
                     "Target advertised native speculative rewind depth \(nativeRewindDepth), but rewound \(rewound) of \(rejected) positions"
