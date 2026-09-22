@@ -39,6 +39,12 @@ public protocol MTPDrafterModel: BaseLanguageModel {
     /// new prompt's. False keeps prompt tokens and hidden states aligned.
     var consumesFullContextHidden: Bool { get }
 
+    /// The block size to use for the next round, given how many drafted
+    /// tokens the target accepted this round and the widest block allowed.
+    /// The default keeps the current size; a drafter whose block can vary
+    /// (DFlash) trades draft width against verify cost from recent acceptance.
+    func nextBlockSize(afterAccepting accepted: Int, current: Int, maximum: Int) -> Int
+
     /// Largest total verification block the drafter can produce efficiently.
     /// `nil` means the caller may choose any block size.
     var maximumBlockSize: Int? { get }
@@ -100,6 +106,7 @@ public protocol MTPDrafterModel: BaseLanguageModel {
 extension MTPDrafterModel {
     public var targetTapLayers: [Int]? { nil }
     public var consumesFullContextHidden: Bool { false }
+    public func nextBlockSize(afterAccepting accepted: Int, current: Int, maximum: Int) -> Int { current }
     public var maximumBlockSize: Int? { nil }
     public var requiresSharedTargetKV: Bool { true }
     public var requiresPromptPrefill: Bool { false }

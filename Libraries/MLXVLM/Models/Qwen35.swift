@@ -740,8 +740,8 @@ public enum Qwen35Language {
                 convKernelSize > 1
                 ? contiguous(convInput[0..., keep ..< (keep + convKernelSize - 1), 0...])
                 : (tape.stateBefore.first ?? nil)
-            if let recurrent { eval(recurrent) }
-            if let convState { eval(convState) }
+            // Left lazy on purpose: the caller evaluates every layer's
+            // restored state in one pass.
             cache.restoreFromSpeculativeTape(keep: keep, convState: convState, recurrentState: recurrent)
         }
     }
@@ -949,16 +949,19 @@ public enum Qwen35Language {
                     return 0
                 }
             }
+            var restored: [MLXArray] = []
             for (index, entry) in cache.enumerated() {
                 if let mamba = entry as? MambaCache {
                     let keep = mamba.speculativeTape!.positions - numTokens
                     layers[index].linearAttn!.replaySpeculativeTape(cache: mamba, keep: keep)
+                    restored.append(contentsOf: mamba.innerState())
                 } else {
                     guard entry.trim(numTokens) == numTokens else {
                         preconditionFailure("Speculative cache validation and rewind diverged")
                     }
                 }
             }
+            eval(restored)
             return numTokens
         }
     }
@@ -1590,6 +1593,33 @@ public class Qwen35: Module, VLMModel {
         }
 
         return visionModel.sanitize(weights: sanitized)
+    }
+}
+
+extension Qwen35 {
+    /// Debug: time each decoder layer of a text-only forward on a warm cache
+    /// (evaluating after every layer). Returns (layer kind, milliseconds).
+    public func debugLayerTimings(tokens: MLXArray, cache: [KVCache]) -> [(String, Double)] {
+        let model = languageModel.model
+        var h = model.embedTokens(tokens)
+        let faMaskMode = createAttentionMask(h: h, cache: cache[model.faIdx], returnArray: true)
+        var faMask: MLXArray?
+        if case .array(let m) = faMaskMode { faMask = m }
+        let ssmMask = createSSMMask(h: h, cache: cache[model.ssmIdx] as? MambaCache)
+        let offset = cache[model.faIdx].offset
+        let S = tokens.dim(1)
+        let positions = MLXArray((offset ..< offset + S).map { Int32($0) }).reshaped(1, -1)
+        let positionIds = broadcast(positions[.newAxis, 0..., 0...], to: [3, 1, S])
+        eval(h)
+        var timings: [(String, Double)] = []
+        for (index, layer) in model.layers.enumerated() {
+            let start = ContinuousClock.now
+            h = layer(h, attentionMask: faMask, ssmMask: layer.isLinear ? ssmMask : nil, cache: cache[index], positionIds: positionIds)
+            eval(h)
+            let d = ContinuousClock.now - start
+            timings.append((layer.isLinear ? "linear" : "attention", Double(d.components.seconds) * 1000 + Double(d.components.attoseconds) / 1e15))
+        }
+        return timings
     }
 }
 

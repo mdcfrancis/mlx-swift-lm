@@ -54,7 +54,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     /// Total tokens proposed per round (`blockSize - 1` drafted, plus the
     /// bonus token from the previous verify). Mirrors mlx-vlm's
     /// `draft_block_size` parameter.
-    public let blockSize: Int
+    public var blockSize: Int
+    /// Widest block this stream may use (drafter and cache limits).
+    private var maximumRoundBlockSize: Int
 
     private var pendingTokens = [Int]()
     private var pendingIndex = 0
@@ -144,6 +146,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let effectiveBlockSize = Swift.min(
             drafterBlockSize, Self.maximumBlockSize(for: mainCache))
         self.blockSize = effectiveBlockSize
+        self.maximumRoundBlockSize = effectiveBlockSize
 
         // Probe by opening a round at the width rounds will actually use and discarding it,
         // rather than duplicating the leaf classification as a predicate that could drift from
@@ -215,6 +218,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     /// Model state a warm cache came with (rope anchors, and possibly the
     /// cached prefix's hidden states for a drafter that wants them).
     private var incomingState: LMOutput.State?
+
+    // Profiling (MTP_PROFILE=1): per-stage wall time of speculative rounds.
+    private var profileClock = Date()
+    private var profileTimes: [String: Double] = [:]
+    private var profileRounds = 0
 
     mutating func prepare(input: LMInput, prefill: PrefillParameters = .init()) throws {
         processor?.prompt(input.text.tokens)
@@ -470,6 +478,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             """
         )
 
+        if Self.profiling { profileLap("between") }
         let bonusToken = y.tokens
         let draftTokens: MLXArray
         if let statefulDrafter = drafter as? any StatefulMTPDrafterModel,
@@ -501,6 +510,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
         // draftTokens shape [B, numDraft] -> flatten to [numDraft].
         let flatDraftTokens = draftTokens.flattened()
+        if Self.profiling { eval(flatDraftTokens); profileLap("draft") }
 
         // Verify pass: main model evaluates [bonus, draft_1, ..., draft_numDraft]
         // in one forward call, emitting state for next round.
@@ -520,44 +530,74 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             verifyInput[text: .newAxis], cache: verifyCache, state: verifyState)
         let mainLogits = mainResult.logits
         mainState = mainResult.state
+        if Self.profiling { eval(mainLogits); profileLap("verify") }
 
         eval(flatDraftTokens)
         let draftTokensList = flatDraftTokens.asArray(Int.self)
 
         var accepted = 0
         var finalToken: MLXArray?
-        for i in 0 ..< numDraft {
-            var logits = mainLogits[0..., verifyStart + i, 0...]
-            logits = processor?.process(logits: logits) ?? logits
-            let targetToken = sampler.sample(logits: logits)
-            eval(targetToken)
-            let targetTokenValue = targetToken.item(Int.self)
-            processor?.didSample(token: targetToken)
-            pendingTokens.append(targetTokenValue)
-            guard targetTokenValue == draftTokensList[i] else {
-                finalToken = targetToken
-                break
+        if processor == nil {
+            // Without a logit processor every position's sample is independent
+            // of the acceptance decisions: take them all in one evaluation
+            // instead of one device round trip per drafted token.
+            let targetTokens = (0 ... numDraft).map { i in
+                sampler.sample(logits: mainLogits[0..., verifyStart + i, 0...])
             }
-            accepted += 1
-        }
+            eval(targetTokens)
+            let targetValues = targetTokens.map { $0.item(Int.self) }
+            for i in 0 ..< numDraft {
+                pendingTokens.append(targetValues[i])
+                guard targetValues[i] == draftTokensList[i] else {
+                    finalToken = targetTokens[i]
+                    break
+                }
+                accepted += 1
+            }
+            if finalToken == nil {
+                pendingTokens.append(targetValues[accepted])
+                finalToken = targetTokens[accepted]
+            }
+        } else {
+            for i in 0 ..< numDraft {
+                var logits = mainLogits[0..., verifyStart + i, 0...]
+                logits = processor?.process(logits: logits) ?? logits
+                let targetToken = sampler.sample(logits: logits)
+                eval(targetToken)
+                let targetTokenValue = targetToken.item(Int.self)
+                processor?.didSample(token: targetToken)
+                pendingTokens.append(targetTokenValue)
+                guard targetTokenValue == draftTokensList[i] else {
+                    finalToken = targetToken
+                    break
+                }
+                accepted += 1
+            }
 
-        // Only the all-accepted path samples the bonus row. On rejection the
-        // mismatching target sample above is already the emitted correction.
-        if finalToken == nil {
-            var logits = mainLogits[0..., verifyStart + accepted, 0...]
-            logits = processor?.process(logits: logits) ?? logits
-            let bonus = sampler.sample(logits: logits)
-            eval(bonus)
-            processor?.didSample(token: bonus)
-            pendingTokens.append(bonus.item(Int.self))
-            finalToken = bonus
+            // Only the all-accepted path samples the bonus row. On rejection the
+            // mismatching target sample above is already the emitted correction.
+            if finalToken == nil {
+                var logits = mainLogits[0..., verifyStart + accepted, 0...]
+                logits = processor?.process(logits: logits) ?? logits
+                let bonus = sampler.sample(logits: logits)
+                eval(bonus)
+                processor?.didSample(token: bonus)
+                pendingTokens.append(bonus.item(Int.self))
+                finalToken = bonus
+            }
         }
+        if Self.profiling { eval(finalToken!); profileLap("accept") }
         let emittedFinalToken = finalToken!
         committedPendingTokenCount = accepted
 
         proposedCount += numDraft
         acceptedCount += accepted
         lastRoundAccepted = accepted
+        blockSize = Swift.max(
+            2,
+            Swift.min(
+                maximumRoundBlockSize,
+                drafter.nextBlockSize(afterAccepting: accepted, current: blockSize, maximum: maximumRoundBlockSize)))
         telemetry.recordRound(
             drafted: numDraft,
             accepted: accepted,
@@ -579,6 +619,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 sampler: sampler)
             drafterState = currentDrafterState
         }
+        if Self.profiling { profileLap("commit") }
 
         let rejected = numDraft - accepted
         let snapshotPlaced: Bool
@@ -617,6 +658,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             y = .init(tokens: emittedFinalToken)
             return
         }
+
+        if Self.profiling { eval(mainCache.flatMap { $0.innerState() }); profileLap("rewind") }
 
         // Dynamic cache quantization may convert regular K/V to quantized K/V,
         // at which point the target's emit-hook cannot provide full_attention
@@ -720,7 +763,23 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 }
 
 extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
+    // MARK: Profiling (MTP_PROFILE=1): per-stage wall time of speculative rounds.
+    static let profiling = ProcessInfo.processInfo.environment["MTP_PROFILE"] != nil
+
+    private mutating func profileLap(_ stage: String) {
+        let now = Date()
+        profileTimes[stage, default: 0] += now.timeIntervalSince(profileClock)
+        profileClock = now
+        if stage == "rewind" { profileRounds += 1 }
+    }
+
     mutating func finalizeGeneration() {
+        if Self.profiling, profileRounds > 0 {
+            let parts = profileTimes.sorted { $0.value > $1.value }.map {
+                String(format: "%@ %.1f ms", $0.key, $0.value * 1000 / Double(profileRounds))
+            }
+            print("mtp profile: \(profileRounds) rounds, per round: " + parts.joined(separator: ", "))
+        }
         // A fully consumed all-accepted round can still retain the recurrent
         // checkpoint used for early-finalization rollback. Release it even
         // when no committed lookahead remains.

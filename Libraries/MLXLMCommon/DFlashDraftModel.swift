@@ -477,6 +477,21 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel {
     public let requiresGreedySampling = true
     public var targetTapLayers: [Int]? { configuration.dflash.targetLayerIds }
     public var consumesFullContextHidden: Bool { true }
+
+    /// Block policy: the verify pass costs about the same up to 4 tokens
+    /// and grows past that (on an M5 Max with Qwen3.8-27B 4-bit: 41 ms at
+    /// 4, 80 ms at 8), so never go below 4 and widen when recent rounds
+    /// accepted enough to pay for the wider pass.
+    public var adaptiveBlock = true
+    /// Exponential moving average of accepted drafted tokens per round.
+    private var acceptedAverage: Double?
+
+    public func nextBlockSize(afterAccepting accepted: Int, current: Int, maximum: Int) -> Int {
+        guard adaptiveBlock else { return current }
+        let average = acceptedAverage.map { 0.7 * $0 + 0.3 * Double(accepted) } ?? Double(accepted)
+        acceptedAverage = average
+        return max(4, min(maximum, Int(average.rounded()) + 3))
+    }
     /// Context kept per layer: the first `sinkSize` positions and the last
     /// `windowSize` (the reference defaults).
     public var sinkSize = 64
@@ -596,6 +611,7 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel {
         appendContext(targetHidden, start: 0, caches: state.cache)
         state.nextPosition = targetHidden.dim(1)
         state.proposalAppended = 0
+        acceptedAverage = nil
     }
 
     public func draftBlock(
