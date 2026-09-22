@@ -2073,6 +2073,7 @@ public func generateTokens(
 public func generate(
     input: LMInput,
     cache: [KVCache]? = nil,
+    state: LMOutput.State? = nil,
     parameters: GenerateParameters,
     context: ModelContext,
     mtpDrafter: any MTPDrafterModel,
@@ -2085,6 +2086,7 @@ public func generate(
         mainModel: context.model,
         drafter: mtpDrafter,
         mainCache: cache,
+        state: state,
         parameters: parameters,
         blockSize: blockSize,
         components: components
@@ -2121,6 +2123,7 @@ public func generate(
 public func generateTokens(
     input: LMInput,
     cache: [KVCache]? = nil,
+    state: LMOutput.State? = nil,
     parameters: GenerateParameters,
     context: ModelContext,
     mtpDrafter: any MTPDrafterModel,
@@ -2133,6 +2136,7 @@ public func generateTokens(
         mainModel: context.model,
         drafter: mtpDrafter,
         mainCache: cache,
+        state: state,
         parameters: parameters,
         blockSize: blockSize,
         components: components

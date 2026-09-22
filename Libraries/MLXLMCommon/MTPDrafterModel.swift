@@ -32,6 +32,13 @@ public protocol MTPDrafterModel: BaseLanguageModel {
     /// normalised state (DFlash-style drafters); nil keeps the final state.
     var targetTapLayers: [Int]? { get }
 
+    /// The drafter's prompt conditioning covers the whole context, so when a
+    /// generation starts from a warm cache whose incoming state carries the
+    /// cached prefix's hidden states (``mtpLastHiddenStatesKey``), the
+    /// iterator hands the drafter those plus the new prompt's, not just the
+    /// new prompt's. False keeps prompt tokens and hidden states aligned.
+    var consumesFullContextHidden: Bool { get }
+
     /// Largest total verification block the drafter can produce efficiently.
     /// `nil` means the caller may choose any block size.
     var maximumBlockSize: Int? { get }
@@ -92,6 +99,7 @@ public protocol MTPDrafterModel: BaseLanguageModel {
 
 extension MTPDrafterModel {
     public var targetTapLayers: [Int]? { nil }
+    public var consumesFullContextHidden: Bool { false }
     public var maximumBlockSize: Int? { nil }
     public var requiresSharedTargetKV: Bool { true }
     public var requiresPromptPrefill: Bool { false }

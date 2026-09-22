@@ -108,6 +108,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         mainModel: any LanguageModel,
         drafter: any MTPDrafterModel,
         mainCache: [KVCache]? = nil,
+        state: LMOutput.State? = nil,
         parameters: GenerateParameters,
         blockSize: Int,
         components: GenerationComponents = .init()
@@ -115,6 +116,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         precondition(
             blockSize >= 2,
             "MTPSpeculativeTokenIterator requires blockSize >= 2 (1 bonus + K-1 drafted)")
+        self.incomingState = state
 
         let kvCachePlan = try parameters.kvCachePlan()
         let mainCache = try kvCachePlan.validated(
@@ -210,11 +212,17 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     /// Prefill the main model with the prompt. The drafter's own state starts
     /// empty; its first-round conditioning inputs come from the prefill's
     /// `LMOutput.state`.
+    /// Model state a warm cache came with (rope anchors, and possibly the
+    /// cached prefix's hidden states for a drafter that wants them).
+    private var incomingState: LMOutput.State?
+
     mutating func prepare(input: LMInput, prefill: PrefillParameters = .init()) throws {
         processor?.prompt(input.text.tokens)
         let inputLength = input.text.cacheSequenceLength
 
-        var prefillState = LMOutput.State()
+        var prefillState = incomingState ?? LMOutput.State()
+        let prefixHidden = drafter.consumesFullContextHidden ? incomingState?[mtpLastHiddenStatesKey] : nil
+        prefillState[mtpLastHiddenStatesKey] = nil
         prefillState[mtpEmitFlagKey] = true
         prefillState[mtpTapLayersKey] = drafter.targetTapLayers
         // Note: the drafter is primed via an explicit follow-up forward call
@@ -328,6 +336,14 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 // bonus is the input to the first speculateRound.
                 pendingTokens.append(token.item(Int.self))
             }
+        }
+
+        // A cached prefix's hidden states precede this prompt's for a drafter
+        // whose conditioning spans the whole context.
+        if let prefixHidden, let promptHidden = mainState?[mtpLastHiddenStatesKey],
+            promptHidden.dim(1) == input.text.tokens.dim(-1)
+        {
+            mainState?[mtpLastHiddenStatesKey] = concatenated([prefixHidden, promptHidden], axis: 1)
         }
 
         if drafter.requiresPromptPrefill,
