@@ -476,6 +476,7 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel {
     public let requiresPromptPrefill = true
     public let requiresGreedySampling = true
     public var targetTapLayers: [Int]? { configuration.dflash.targetLayerIds }
+    public var consumesFullContextHidden: Bool { true }
     /// Context kept per layer: the first `sinkSize` positions and the last
     /// `windowSize` (the reference defaults).
     public var sinkSize = 64
@@ -590,11 +591,10 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel {
         target: any LanguageModel, promptTokens: MLXArray, targetHidden: MLXArray, firstBonus: MLXArray,
         positionDeltas: MLXArray?, state: inout MTPDrafterState, sampler: any LogitSampler
     ) {
-        let promptLength = promptTokens.dim(-1)
-        let hidden = targetHidden.dim(1) > promptLength
-            ? targetHidden[0..., (targetHidden.dim(1) - promptLength)..., 0...] : targetHidden
-        appendContext(hidden, start: 0, caches: state.cache)
-        state.nextPosition = promptLength
+        // Everything the target has seen so far (a cached prefix's hidden
+        // states arrive concatenated before the prompt's).
+        appendContext(targetHidden, start: 0, caches: state.cache)
+        state.nextPosition = targetHidden.dim(1)
         state.proposalAppended = 0
     }
 
