@@ -1596,33 +1596,6 @@ public class Qwen35: Module, VLMModel {
     }
 }
 
-extension Qwen35 {
-    /// Debug: time each decoder layer of a text-only forward on a warm cache
-    /// (evaluating after every layer). Returns (layer kind, milliseconds).
-    public func debugLayerTimings(tokens: MLXArray, cache: [KVCache]) -> [(String, Double)] {
-        let model = languageModel.model
-        var h = model.embedTokens(tokens)
-        let faMaskMode = createAttentionMask(h: h, cache: cache[model.faIdx], returnArray: true)
-        var faMask: MLXArray?
-        if case .array(let m) = faMaskMode { faMask = m }
-        let ssmMask = createSSMMask(h: h, cache: cache[model.ssmIdx] as? MambaCache)
-        let offset = cache[model.faIdx].offset
-        let S = tokens.dim(1)
-        let positions = MLXArray((offset ..< offset + S).map { Int32($0) }).reshaped(1, -1)
-        let positionIds = broadcast(positions[.newAxis, 0..., 0...], to: [3, 1, S])
-        eval(h)
-        var timings: [(String, Double)] = []
-        for (index, layer) in model.layers.enumerated() {
-            let start = ContinuousClock.now
-            h = layer(h, attentionMask: faMask, ssmMask: layer.isLinear ? ssmMask : nil, cache: cache[index], positionIds: positionIds)
-            eval(h)
-            let d = ContinuousClock.now - start
-            timings.append((layer.isLinear ? "linear" : "attention", Double(d.components.seconds) * 1000 + Double(d.components.attoseconds) / 1e15))
-        }
-        return timings
-    }
-}
-
 extension Qwen35: SpeculativeCacheRewindModel {
     /// One token restores the checkpoint after the bonus token; more replay
     /// the recorded tape (``mtpSpeculativeTapeKey``).

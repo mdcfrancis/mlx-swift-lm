@@ -2104,6 +2104,27 @@ public func generate(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     tools: [[String: any Sendable]]? = nil
 ) throws -> AsyncStream<Generation> {
+    var options = SpeculativeOptions()
+    options.blockSize = blockSize
+    options.adaptiveBlock = false
+    return try generate(
+        input: input, cache: cache, state: state, parameters: parameters, context: context,
+        mtpDrafter: mtpDrafter, options: options, components: components, wiredMemoryTicket: wiredMemoryTicket)
+}
+
+/// The MTP-drafter variant above with the round policy spelled out in
+/// ``SpeculativeOptions``.
+public func generate(
+    input: LMInput,
+    cache: [KVCache]? = nil,
+    state: LMOutput.State? = nil,
+    parameters: GenerateParameters,
+    context: ModelContext,
+    mtpDrafter: any MTPDrafterModel,
+    options: SpeculativeOptions,
+    components: GenerationComponents = .init(),
+    wiredMemoryTicket: WiredMemoryTicket? = nil
+) throws -> AsyncStream<Generation> {
     let iterator = try MTPSpeculativeTokenIterator(
         input: input,
         mainModel: context.model,
@@ -2111,7 +2132,7 @@ public func generate(
         mainCache: cache,
         state: state,
         parameters: parameters,
-        blockSize: blockSize,
+        options: options,
         components: components
     )
     let (stream, _) = generateLoopTask(
@@ -2156,6 +2177,27 @@ public func generateTokens(
     components: GenerationComponents = .init(),
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<TokenGeneration> {
+    var options = SpeculativeOptions()
+    options.blockSize = blockSize
+    options.adaptiveBlock = false
+    return try generateTokens(
+        input: input, cache: cache, state: state, parameters: parameters, context: context,
+        mtpDrafter: mtpDrafter, options: options, components: components, wiredMemoryTicket: wiredMemoryTicket)
+}
+
+/// The MTP-drafter variant above with the round policy spelled out in
+/// ``SpeculativeOptions``.
+public func generateTokens(
+    input: LMInput,
+    cache: [KVCache]? = nil,
+    state: LMOutput.State? = nil,
+    parameters: GenerateParameters,
+    context: ModelContext,
+    mtpDrafter: any MTPDrafterModel,
+    options: SpeculativeOptions,
+    components: GenerationComponents = .init(),
+    wiredMemoryTicket: WiredMemoryTicket? = nil
+) throws -> AsyncStream<TokenGeneration> {
     let iterator = try MTPSpeculativeTokenIterator(
         input: input,
         mainModel: context.model,
@@ -2163,7 +2205,7 @@ public func generateTokens(
         mainCache: cache,
         state: state,
         parameters: parameters,
-        blockSize: blockSize,
+        options: options,
         components: components
     )
     let (stream, _) = generateLoopTask(

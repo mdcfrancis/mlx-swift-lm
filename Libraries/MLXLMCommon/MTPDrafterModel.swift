@@ -332,6 +332,46 @@ public let mtpPositionDeltasKey =
 /// reads as `false` (no emit), so non-MTP callers are unaffected.
 public let mtpEmitFlagKey = LMOutput.Key<Bool>("mtp.emitDrafterState")
 
+/// How a speculative generation runs its rounds.
+public struct SpeculativeOptions: Sendable {
+    /// Tokens per round: one bonus plus `blockSize - 1` drafted. Clamped to
+    /// what the drafter and the cache allow.
+    public var blockSize = 4
+    /// Let the drafter re-choose the block each round from recent acceptance
+    /// (``MTPDrafterModel/nextBlockSize(afterAccepting:current:maximum:)``).
+    public var adaptiveBlock = true
+    /// Row counts the target's ``SpeculativeVerifyKernels`` serve. A verify
+    /// pass is padded up to the smallest one that fits when the padding is
+    /// less than half of it (2 rows stay 2; 3 become 4; 9-16 become 16);
+    /// padding rows are rolled back like rejected drafts. Empty: verify
+    /// exactly the round's tokens.
+    public var verifyRowMultiples: [Int] = []
+
+    /// The width a verify pass of `rows` tokens runs at under this policy.
+    public func verifyRows(for rows: Int) -> Int {
+        guard let width = verifyRowMultiples.sorted().first(where: { $0 >= rows }), rows * 2 > width else { return rows }
+        return width
+    }
+    /// Called after every round with what happened in it.
+    public var observer: (@Sendable (SpeculativeRoundReport) -> Void)?
+    /// Measure each stage of a round (adds synchronisation points; for
+    /// profiling only).
+    public var timing = false
+
+    public init() {}
+}
+
+/// One speculative round as seen by ``SpeculativeOptions/observer``.
+public struct SpeculativeRoundReport: Sendable {
+    public var round: Int
+    public var blockSize: Int
+    public var drafted: Int
+    public var accepted: Int
+    public var verifiedRows: Int
+    /// Wall milliseconds per stage when ``SpeculativeOptions/timing`` is on.
+    public var stageMilliseconds: [String: Double]?
+}
+
 /// Iterator asks the target which decoder-layer outputs to publish under
 /// ``mtpLastHiddenStatesKey`` (see ``MTPDrafterModel/targetTapLayers``).
 public let mtpTapLayersKey = LMOutput.Key<[Int]>("mtp.tapLayers")

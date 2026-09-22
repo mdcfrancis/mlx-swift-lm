@@ -482,12 +482,10 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel {
     /// and grows past that (on an M5 Max with Qwen3.8-27B 4-bit: 41 ms at
     /// 4, 80 ms at 8), so never go below 4 and widen when recent rounds
     /// accepted enough to pay for the wider pass.
-    public var adaptiveBlock = true
     /// Exponential moving average of accepted drafted tokens per round.
     private var acceptedAverage: Double?
 
     public func nextBlockSize(afterAccepting accepted: Int, current: Int, maximum: Int) -> Int {
-        guard adaptiveBlock else { return current }
         let average = acceptedAverage.map { 0.7 * $0 + 0.3 * Double(accepted) } ?? Double(accepted)
         acceptedAverage = average
         return max(4, min(maximum, Int(average.rounded()) + 3))
@@ -646,9 +644,6 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel {
         // The verify pass covered the bonus token and the drafted ones; the
         // bonus and the accepted drafts are now context.
         let committed = min(acceptedCount + 1, targetHidden.dim(1))
-        if ProcessInfo.processInfo.environment["DFLASH_DEBUG"] != nil {
-            print("dflash round: drafted \(draftTokens.dim(-1)) accepted \(acceptedCount) at position \(state.nextPosition)")
-        }
         appendContext(targetHidden[0..., ..<committed, 0...], start: state.nextPosition, caches: state.cache)
         state.nextPosition += committed
         state.proposalAppended = 0
