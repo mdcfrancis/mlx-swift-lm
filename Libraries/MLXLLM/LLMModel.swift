@@ -37,6 +37,34 @@ extension LLMModel {
         // at any prompt length.
         guard total > stepSize else { return .tokens(y) }
 
+        // A drafter prefill wants the target's hidden states for every
+        // prompt position: process the whole prompt here, chunk by chunk,
+        // and stitch what each chunk emitted.
+        if let state, state[mtpEmitFlagKey] == true {
+            var emitted: [MLXArray] = []
+            var last: LMOutput?
+            try withPreparedCache(cache, lengths: y.sequenceLengths) {
+                let processed = try prefill.forEachChunk(total: total) { range in
+                    let output = self(y[.newAxis, range], cache: cache.isEmpty ? nil : cache, state: state)
+                    if let hidden = output.state?[mtpLastHiddenStatesKey] { emitted.append(hidden) }
+                    last = output
+                    asyncEval(cache)
+                }
+                if processed < total {
+                    let output = self(y[.newAxis, processed ..< total], cache: cache.isEmpty ? nil : cache, state: state)
+                    if let hidden = output.state?[mtpLastHiddenStatesKey] { emitted.append(hidden) }
+                    last = output
+                }
+                eval(cache)
+            }
+            guard let last else { return .tokens(y) }
+            var outState = last.state ?? LMOutput.State()
+            if !emitted.isEmpty {
+                outState[mtpLastHiddenStatesKey] = emitted.count == 1 ? emitted[0] : concatenated(emitted, axis: 1)
+            }
+            return .logits(LMOutput(logits: last.logits, state: outState))
+        }
+
         var processed = 0
         try withPreparedCache(cache, lengths: y.sequenceLengths) {
             // asyncEval lets the CPU build chunk N+1's graph while the GPU evaluates
