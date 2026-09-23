@@ -70,7 +70,7 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
     public let maximumBlockSize: Int? = 2
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
-    public let requiresGreedySampling = true
+    public let requiresGreedySampling = false
     private let preconvertedNorms: Bool
 
     @ModuleInfo(key: "mtp") var mtp: Qwen35MTPPredictor

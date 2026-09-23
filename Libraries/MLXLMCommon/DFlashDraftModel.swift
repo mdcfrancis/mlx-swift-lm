@@ -503,7 +503,7 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel, OnlineAdap
     public var maximumBlockSize: Int? { configuration.dflash.blockSize }
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
-    public let requiresGreedySampling = true
+    public let requiresGreedySampling = false
     public var targetTapLayers: [Int]? { configuration.dflash.targetLayerIds }
     public var consumesFullContextHidden: Bool { true }
 

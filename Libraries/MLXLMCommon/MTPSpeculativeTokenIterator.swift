@@ -48,6 +48,12 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
     var processor: LogitProcessor?
     let sampler: LogitSampler
+    /// Temperature above zero: drafts are verified by rejection sampling
+    /// against the sampler's distribution, so the output keeps the
+    /// target's sampled distribution exactly (the draft is a point mass:
+    /// a token is kept with probability p(token), else the round ends with
+    /// a draw from the residual p with that token removed).
+    let samplesFromDistribution: Bool
 
     public var tokenCount: Int { telemetry.emittedTokenCount }
     public let maxTokens: Int?
@@ -152,6 +158,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             .makeState(parameters: parameters)
 
         self.sampler = parameters.sampler()
+        self.samplesFromDistribution = parameters.temperature != 0
         try components.validate(parameters: parameters)
         self.processor = components.logitProcessor(parameters: parameters)
 
@@ -568,7 +575,41 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
         var accepted = 0
         var finalToken: MLXArray?
-        if processor == nil {
+        if processor == nil, samplesFromDistribution,
+            let probs = sampler.distribution(logits: mainLogits[0, verifyStart ..< (verifyStart + numDraft + 1), 0...])
+        {
+            // Speculative sampling with a deterministic draft: keep draft i
+            // with probability p_i(draft_i); at the first rejection draw
+            // from p_i with the draft removed; after a full acceptance draw
+            // the bonus from the last row. Exact for the target's
+            // distribution, whatever the draft proposed.
+            let drafts = MLXArray(draftTokensList.map { Int32($0) }).reshaped(-1, 1)
+            let pDraft = takeAlong(probs[..<numDraft], drafts, axis: -1).squeezed(axis: -1)
+            let coins = MLXRandom.uniform(0 ..< 1, [numDraft])
+            let keep = coins .<= pDraft
+            eval(keep, probs)
+            let keeps = keep.asArray(Bool.self)
+            while accepted < numDraft, keeps[accepted] {
+                pendingTokens.append(draftTokensList[accepted])
+                accepted += 1
+            }
+            // Rows stay `[1, V]` so the sampled token is `[1]`, the shape
+            // the rest of the round expects.
+            let token: MLXArray
+            if accepted < numDraft {
+                let vocabulary = MLXArray.arange(probs.dim(-1))
+                var residual = MLX.where(
+                    vocabulary .== Int32(draftTokensList[accepted]), MLXArray(Float(0)),
+                    probs[accepted ..< (accepted + 1)])
+                residual = residual / maximum(residual.sum(axis: -1, keepDims: true), MLXArray(Float(1e-30)))
+                token = sampler.sample(distribution: residual)
+            } else {
+                token = sampler.sample(distribution: probs[numDraft ..< (numDraft + 1)])
+            }
+            eval(token)
+            pendingTokens.append(token.item(Int.self))
+            finalToken = token
+        } else if processor == nil {
             // Without a logit processor every position's sample is independent
             // of the acceptance decisions: take them all in one evaluation
             // instead of one device round trip per drafted token.
