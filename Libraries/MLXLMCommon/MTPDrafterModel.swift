@@ -366,6 +366,9 @@ public struct SpeculativeOptions: Sendable {
 
 /// A drafter that adapts itself online from verify passes.
 public protocol OnlineAdaptingDrafter: AnyObject {
+    /// Asked once per round, before the targets are gathered (a device
+    /// sync): whether this round should train.
+    func wantsLearningStep(accepted: Int, drafted: Int) -> Bool
     /// `targets` are the target's tokens at the drafted positions of the
     /// round just verified, `accepted` how many drafts it kept.
     func learn(targets: [Int], accepted: Int, drafted: Int)

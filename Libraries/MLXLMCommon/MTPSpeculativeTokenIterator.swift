@@ -660,7 +660,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
         if options.timing { eval(finalToken!) }
         stageLap("accept")
-        if options.onlineLearning, processor == nil, let learner = drafter as? any OnlineAdaptingDrafter {
+        if options.onlineLearning, processor == nil, let learner = drafter as? any OnlineAdaptingDrafter,
+            learner.wantsLearningStep(accepted: accepted, drafted: numDraft)
+        {
             // The target's choices at every drafted position, rejected ones
             // included, are the supervision; only the no-processor path
             // has them all.

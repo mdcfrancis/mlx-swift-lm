@@ -536,6 +536,11 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel, OnlineAdap
         public var onlyRejectedRounds = true
         /// Of the eligible rounds, train on every n-th.
         public var everyRounds = 1
+        /// Also adapt the projection of the target's tapped hidden states
+        /// (`fc`), where a fine-tune's shift in hidden states lands. The
+        /// context cache holds projections made with the weights of the
+        /// moment, so within one generation older entries lag slightly.
+        public var includeContextProjection = false
         public init() {}
     }
 
@@ -568,6 +573,10 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel, OnlineAdap
                 ("down_proj", DFlashLoRALinear(mlp.down, rank: config.rank, scale: config.scale)),
             ]
             mlp.update(modules: .unflattened(mlpUpdate))
+        }
+        if config.includeContextProjection {
+            let update: [(String, Module)] = [("fc", DFlashLoRALinear(fc, rank: config.rank, scale: config.scale))]
+            self.update(modules: .unflattened(update))
         }
         optimizer = Adam(learningRate: config.learningRate)
         onlineAdaptation = config
@@ -615,15 +624,19 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel, OnlineAdap
         return crossEntropy(logits: logits.reshaped(-1, logits.dim(-1)), targets: targets.reshaped(-1), reduction: .mean)
     }
 
+    public func wantsLearningStep(accepted: Int, drafted: Int) -> Bool {
+        guard let config = onlineAdaptation, config.learningRate > 0, lastDraft != nil else { return false }
+        if config.onlyRejectedRounds, accepted >= drafted { return false }
+        eligibleRounds += 1
+        return eligibleRounds % max(1, config.everyRounds) == 0
+    }
+
     /// One adaptation step from a verify pass: `targets` are the target's
     /// tokens at the drafted positions (what the draft should have said).
     public func learn(targets: [Int], accepted: Int, drafted: Int) {
-        guard let config = onlineAdaptation, config.learningRate > 0, let lossAndGrad, let optimizer,
+        guard onlineAdaptation != nil, let lossAndGrad, let optimizer,
             let last = lastDraft, targets.count >= last.blockSize - 1
         else { return }
-        if config.onlyRejectedRounds, accepted >= drafted { return }
-        eligibleRounds += 1
-        guard eligibleRounds % max(1, config.everyRounds) == 0 else { return }
         // Rows past the first rejection were predicted from the wrong
         // prefix (the rejected drafts), so only the accepted positions and
         // the rejection itself supervise the draft.
