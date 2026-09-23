@@ -619,6 +619,15 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
         if options.timing { eval(finalToken!) }
         stageLap("accept")
+        if options.onlineLearning, processor == nil, let learner = drafter as? any OnlineAdaptingDrafter {
+            // The target's choices at every drafted position, rejected ones
+            // included, are the supervision; only the no-processor path
+            // has them all.
+            let targets = (0 ..< numDraft).map { mainLogits[0..., verifyStart + $0, 0...] }
+            let chosen = argMax(stacked(targets, axis: 0), axis: -1).asArray(Int.self)
+            learner.learn(targets: chosen, accepted: accepted, drafted: numDraft)
+            stageLap("learn")
+        }
         let emittedFinalToken = finalToken!
         committedPendingTokenCount = accepted
 

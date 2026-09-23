@@ -352,6 +352,9 @@ public struct SpeculativeOptions: Sendable {
         guard let width = verifyRowMultiples.sorted().first(where: { $0 >= rows }), rows * 2 > width else { return rows }
         return width
     }
+    /// Let a drafter that can (``OnlineAdaptingDrafter``) learn from each
+    /// verify pass what the target actually chose.
+    public var onlineLearning = false
     /// Called after every round with what happened in it.
     public var observer: (@Sendable (SpeculativeRoundReport) -> Void)?
     /// Measure each stage of a round (adds synchronisation points; for
@@ -359,6 +362,13 @@ public struct SpeculativeOptions: Sendable {
     public var timing = false
 
     public init() {}
+}
+
+/// A drafter that adapts itself online from verify passes.
+public protocol OnlineAdaptingDrafter: AnyObject {
+    /// `targets` are the target's tokens at the drafted positions of the
+    /// round just verified, `accepted` how many drafts it kept.
+    func learn(targets: [Int], accepted: Int, drafted: Int)
 }
 
 /// One speculative round as seen by ``SpeculativeOptions/observer``.

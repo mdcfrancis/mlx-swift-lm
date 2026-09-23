@@ -28,6 +28,11 @@ public struct VerifyKernelOptions: Sendable {
 }
 
 public enum SpeculativeVerifyKernels {
+    /// While set, installed linears use MLX's own matmul. Custom kernels
+    /// have no gradient, so a pass that will be differentiated (online
+    /// draft adaptation) runs with this on.
+    nonisolated(unsafe) public static var isBypassed = false
+
     /// The 4-row kernel runs on any Apple GPU; the 16-row kernel needs the
     /// tensor units of the M5 generation and macOS 26.2 or later.
     public static var isAvailable: Bool { MLX.GPU.deviceInfo().architecture.lowercased().hasPrefix("applegpu") }
@@ -107,7 +112,9 @@ open class VerifyQuantizedLinear: QuantizedLinear {
 
     open override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let rows = x.size / inputSize
-        guard servedRows.contains(rows), x.dtype == .bfloat16 || x.dtype == .float16, let biases else {
+        guard servedRows.contains(rows), x.dtype == .bfloat16 || x.dtype == .float16, let biases,
+            !SpeculativeVerifyKernels.isBypassed
+        else {
             return super.callAsFunction(x)
         }
         let x2 = x.reshaped(rows, inputSize)

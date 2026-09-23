@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXNN
+import MLXOptimizers
 
 // DFlash speculative decoding (arXiv:2602.06036): a small block-diffusion
 // draft proposes a whole block of tokens in one non-causal pass, conditioned
@@ -227,6 +228,34 @@ public final class DFlashContextCache: BaseKVCache {
         new.positions = positions
         new.offset = offset
         return new
+    }
+}
+
+// MARK: - Online adaptation
+
+/// A frozen `Linear` with a trainable low-rank update on top, for adapting
+/// the draft to a target that differs from the one it was trained on. The
+/// factors are float32 (the optimizer needs them); the update is cast back
+/// to the weight's dtype so the rest of the draft stays in bf16.
+final class DFlashLoRALinear: Linear {
+    let scale: Float
+    @ParameterInfo(key: "lora_a") var loraA: MLXArray
+    @ParameterInfo(key: "lora_b") var loraB: MLXArray
+
+    init(_ linear: Linear, rank: Int, scale: Float) {
+        self.scale = scale
+        let (outputs, inputs) = linear.shape
+        let bound = 1 / sqrt(Float(inputs))
+        _loraA.wrappedValue = MLXRandom.uniform(low: -bound, high: bound, [inputs, rank])
+        _loraB.wrappedValue = MLXArray.zeros([rank, outputs])
+        super.init(weight: linear.weight, bias: linear.bias)
+        freeze(recursive: false, keys: ["weight", "bias"])
+    }
+
+    override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let y = super.callAsFunction(x)
+        let update = matmul(matmul(x.asType(.float32), loraA), loraB) * scale
+        return y + update.asType(y.dtype)
     }
 }
 
@@ -468,7 +497,7 @@ final class DFlashCandidateSelector: Module {
 
 // MARK: - Draft model
 
-public final class DFlashDraftModel: Module, StatefulMTPDrafterModel {
+public final class DFlashDraftModel: Module, StatefulMTPDrafterModel, OnlineAdaptingDrafter {
     public let configuration: DFlashDraftConfiguration
     public var blockSize: Int { configuration.dflash.blockSize }
     public var maximumBlockSize: Int? { configuration.dflash.blockSize }
@@ -494,6 +523,124 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel {
     /// `windowSize` (the reference defaults).
     public var sinkSize = 64
     public var windowSize = 1024
+
+    /// Online adaptation of the draft to the target it runs against: a LoRA
+    /// on the block path (attention q/o and the MLP, never the cached k/v
+    /// or the context projection), trained after verify passes from what
+    /// the target actually chose.
+    public struct OnlineAdaptation: Sendable {
+        public var rank = 16
+        public var scale: Float = 2
+        public var learningRate: Float = 1e-4
+        /// Take a step only on rounds where the target rejected a draft.
+        public var onlyRejectedRounds = true
+        /// Of the eligible rounds, train on every n-th.
+        public var everyRounds = 1
+        public init() {}
+    }
+
+    public private(set) var onlineAdaptation: OnlineAdaptation?
+    public private(set) var onlineSteps = 0
+    /// Exponential moving average of the training loss (mean token
+    /// cross-entropy over the block), nil until the first step.
+    public private(set) var onlineLoss: Float?
+    private var optimizer: Adam?
+    private var eligibleRounds = 0
+    private var lossAndGrad: ((DFlashDraftModel, [MLXArray]) -> ([MLXArray], ModuleParameters))?
+    /// The inputs of the last block drafted, so the step can replay it.
+    private var lastDraft: (anchor: MLXArray, target: any DFlashTargetModel, caches: [KVCache], queryOffset: Int, blockSize: Int)?
+
+    /// Install the adapter (once) and start learning.
+    public func enableOnlineAdaptation(_ config: OnlineAdaptation = OnlineAdaptation()) {
+        guard onlineAdaptation == nil else { onlineAdaptation = config; return }
+        freeze()
+        for layer in layers {
+            let attention = layer.attention
+            let attentionUpdate: [(String, Module)] = [
+                ("q_proj", DFlashLoRALinear(attention.qProj, rank: config.rank, scale: config.scale)),
+                ("o_proj", DFlashLoRALinear(attention.oProj, rank: config.rank, scale: config.scale)),
+            ]
+            attention.update(modules: .unflattened(attentionUpdate))
+            let mlp = layer.mlp
+            let mlpUpdate: [(String, Module)] = [
+                ("gate_proj", DFlashLoRALinear(mlp.gate, rank: config.rank, scale: config.scale)),
+                ("up_proj", DFlashLoRALinear(mlp.up, rank: config.rank, scale: config.scale)),
+                ("down_proj", DFlashLoRALinear(mlp.down, rank: config.rank, scale: config.scale)),
+            ]
+            mlp.update(modules: .unflattened(mlpUpdate))
+        }
+        optimizer = Adam(learningRate: config.learningRate)
+        onlineAdaptation = config
+        lossAndGrad = valueAndGrad(model: self) { model, arrays in
+            [model.adaptationLoss(targets: arrays[0])]
+        }
+    }
+
+    /// The adapter's weights (empty when adaptation is off).
+    public func adapterWeights() -> [String: MLXArray] {
+        guard onlineAdaptation != nil else { return [:] }
+        return Dictionary(uniqueKeysWithValues: trainableParameters().flattened())
+    }
+
+    public func loadAdapterWeights(_ weights: [String: MLXArray]) throws {
+        guard onlineAdaptation != nil else { return }
+        let expected = Set(adapterWeights().keys)
+        let usable = weights.filter { expected.contains($0.key) }
+        guard usable.count == expected.count else {
+            throw NSError(
+                domain: "DFlashDraftModel", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "adapter has \(usable.count) of \(expected.count) expected tensors"])
+        }
+        update(parameters: ModuleParameters.unflattened(usable))
+        eval(trainableParameters())
+    }
+
+    /// Mean cross-entropy of the draft's block logits against the target's
+    /// tokens at the first `targets.dim(1)` drafted positions, replaying
+    /// the last block over the live context cache.
+    private func adaptationLoss(targets: MLXArray) -> MLXArray {
+        guard let last = lastDraft else { return MLXArray(Float(0)) }
+        let count = targets.dim(1)
+        let B = last.anchor.dim(0)
+        let masks = MLXArray.full([B, last.blockSize - 1], values: MLXArray(Int32(configuration.dflash.maskTokenId)))
+        let tokens = concatenated([last.anchor.asType(.int32), masks], axis: 1)
+        var h = last.target.dflashTokenEmbedding(tokens)
+        let scale = last.target.dflashEmbeddingScale * (configuration.dflash.inputEmbeddingScale ?? 1)
+        if scale != 1 { h = h * scale }
+        for (layer, entry) in zip(layers, last.caches) {
+            h = layer(h, cache: entry as? DFlashContextCache, queryOffset: last.queryOffset)
+        }
+        let hidden = norm(h)[0..., 1 ..< (1 + count), 0...]
+        let logits = last.target.dflashLogits(hidden).asType(.float32)
+        return crossEntropy(logits: logits.reshaped(-1, logits.dim(-1)), targets: targets.reshaped(-1), reduction: .mean)
+    }
+
+    /// One adaptation step from a verify pass: `targets` are the target's
+    /// tokens at the drafted positions (what the draft should have said).
+    public func learn(targets: [Int], accepted: Int, drafted: Int) {
+        guard let config = onlineAdaptation, config.learningRate > 0, let lossAndGrad, let optimizer,
+            let last = lastDraft, targets.count >= last.blockSize - 1
+        else { return }
+        if config.onlyRejectedRounds, accepted >= drafted { return }
+        eligibleRounds += 1
+        guard eligibleRounds % max(1, config.everyRounds) == 0 else { return }
+        // Rows past the first rejection were predicted from the wrong
+        // prefix (the rejected drafts), so only the accepted positions and
+        // the rejection itself supervise the draft.
+        let valid = min(accepted + 1, last.blockSize - 1, targets.count)
+        guard valid > 0 else { return }
+        let target = MLXArray(targets.prefix(valid).map { Int32($0) }).reshaped(1, -1)
+        // The target's output head may run on the verify kernels, which
+        // cannot be differentiated through.
+        SpeculativeVerifyKernels.isBypassed = true
+        defer { SpeculativeVerifyKernels.isBypassed = false }
+        let (values, gradients) = lossAndGrad(self, [target])
+        optimizer.update(model: self, gradients: gradients)
+        eval(trainableParameters(), optimizer)
+        let loss = values[0].item(Float.self)
+        onlineLoss = onlineLoss.map { 0.9 * $0 + 0.1 * loss } ?? loss
+        onlineSteps += 1
+    }
 
     @ModuleInfo(key: "layers") var layers: [DFlashDecoderLayer]
     @ModuleInfo(key: "norm") var norm: RMSNorm
@@ -622,6 +769,9 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel {
         let anchor = lastToken.ndim == 1 ? lastToken.reshaped(lastToken.dim(0), 1) : lastToken
         let proposed = draft(
             anchor: anchor, target: target, caches: state.cache, queryOffset: state.nextPosition, blockSize: blockSize)
+        if onlineAdaptation != nil {
+            lastDraft = (anchor, target, state.cache, state.nextPosition, blockSize)
+        }
         state.proposalAppended = blockSize - 1
         return proposed
     }
