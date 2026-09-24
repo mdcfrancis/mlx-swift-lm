@@ -225,6 +225,36 @@ public final class DFlashContextCache: BaseKVCache {
         rowPositions = rowPositions?[index]
     }
 
+    /// Rows from single-row caches with different entry counts; shorter
+    /// rows are padded with entries at position -1 (never attended).
+    static func merged(_ rows: [DFlashContextCache]) -> DFlashContextCache {
+        precondition(!rows.isEmpty)
+        let new = DFlashContextCache(sinkSize: rows[0].sinkSize, windowSize: rows[0].windowSize)
+        let longest = rows.map(\.length).max() ?? 0
+        var keyRows: [MLXArray] = []
+        var valueRows: [MLXArray] = []
+        var positionRows: [MLXArray] = []
+        for row in rows {
+            let pad = longest - row.length
+            var k = row.keys ?? MLXArray.zeros([1, 1, 0, 1])
+            var v = row.values ?? MLXArray.zeros([1, 1, 0, 1])
+            var p = MLXArray(row.positions)
+            if pad > 0 {
+                k = concatenated([k, MLXArray.zeros([1, k.dim(1), pad, k.dim(3)], dtype: k.dtype)], axis: 2)
+                v = concatenated([v, MLXArray.zeros([1, v.dim(1), pad, v.dim(3)], dtype: v.dtype)], axis: 2)
+                p = concatenated([p, MLXArray(Array(repeating: Int32(-1), count: pad))])
+            }
+            keyRows.append(k)
+            valueRows.append(v)
+            positionRows.append(p.reshaped(1, -1))
+        }
+        new.keys = concatenated(keyRows, axis: 0)
+        new.values = concatenated(valueRows, axis: 0)
+        new.rowPositions = concatenated(positionRows, axis: 0)
+        new.offset = rows.map(\.offset).max() ?? 0
+        return new
+    }
+
     public override var state: [MLXArray] {
         get { innerState() }
         set {
@@ -884,6 +914,14 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel, OnlineAdap
     /// The single-row drafter state's caches expanded to `rows` rows.
     func expandedCaches(_ caches: [KVCache], rows: Int) -> [KVCache] {
         caches.map { ($0 as? DFlashContextCache)?.expanded(rows: rows) ?? $0 }
+    }
+
+    /// One drafter state per row, merged into ragged caches.
+    func mergedCaches(_ rows: [[KVCache]]) -> [KVCache] {
+        precondition(!rows.isEmpty)
+        return (0 ..< rows[0].count).map { layer in
+            DFlashContextCache.merged(rows.map { $0[layer] as! DFlashContextCache })
+        }
     }
 
     func filterCaches(_ caches: [KVCache], rows: [Int]) {

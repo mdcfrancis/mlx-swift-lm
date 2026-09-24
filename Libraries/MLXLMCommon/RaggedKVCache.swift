@@ -50,6 +50,35 @@ public final class RaggedKVCache: BaseKVCache {
         offset = length
     }
 
+    /// Rows from single-row caches of different lengths, each placed at
+    /// the start of its physical row.
+    public convenience init(merging singles: [KVCache]) {
+        self.init(rows: singles.count)
+        let states = singles.map { $0.state }
+        precondition(states.allSatisfy { $0.count == 2 }, "RaggedKVCache: every row needs [keys, values]")
+        let rowLengths = singles.map { $0.offset }
+        let longest = rowLengths.max() ?? 0
+        var keyRows: [MLXArray] = []
+        var valueRows: [MLXArray] = []
+        for (state, length) in zip(states, rowLengths) {
+            let k = state[0][.ellipsis, ..<length, 0...]
+            let v = state[1][.ellipsis, ..<length, 0...]
+            let pad = longest - length
+            if pad > 0 {
+                keyRows.append(concatenated([k, MLXArray.zeros([1, k.dim(1), pad, k.dim(3)], dtype: k.dtype)], axis: 2))
+                valueRows.append(concatenated([v, MLXArray.zeros([1, v.dim(1), pad, v.dim(3)], dtype: v.dtype)], axis: 2))
+            } else {
+                keyRows.append(k)
+                valueRows.append(v)
+            }
+        }
+        keys = concatenated(keyRows, axis: 0)
+        values = concatenated(valueRows, axis: 0)
+        lengths = rowLengths
+        lengthsBeforeLastWrite = rowLengths
+        offset = longest
+    }
+
     public var rows: Int { lengths.count }
 
     public override func innerState() -> [MLXArray] {

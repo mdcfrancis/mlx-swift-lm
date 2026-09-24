@@ -1589,6 +1589,33 @@ extension Qwen35: RaggedSpeculativeTarget {
         }
     }
 
+    public func mergeCaches(_ rows: [[KVCache]]) -> [KVCache] {
+        precondition(!rows.isEmpty)
+        let layers = rows[0].count
+        precondition(rows.allSatisfy { $0.count == layers })
+        return (0 ..< layers).map { layer -> KVCache in
+            let entries = rows.map { $0[layer] }
+            if let first = entries.first as? MambaCache {
+                let mambas = entries.map { $0 as! MambaCache }
+                let merged = MambaCache()
+                // Every row has the same state shapes (fixed-size recurrent
+                // and conv states); a row without state contributes zeros.
+                func stacked(_ index: Int) -> MLXArray? {
+                    let parts = mambas.compactMap { $0[index] }
+                    guard let template = parts.first else { return nil }
+                    return concatenated(
+                        mambas.map { $0[index] ?? MLXArray.zeros(template.shape, dtype: template.dtype) }, axis: 0)
+                }
+                merged[0] = stacked(0)
+                merged[1] = stacked(1)
+                merged.offset = mambas.map(\.offset).max() ?? first.offset
+                return merged
+            }
+            precondition(entries.allSatisfy { $0.maxSize == nil }, "ragged batching needs unbounded attention caches")
+            return RaggedKVCache(merging: entries)
+        }
+    }
+
     public func rewindSpeculativeCache(_ cache: [KVCache], keepPerRow keep: [Int]) {
         languageModel.model.rewindSpeculativeCache(cache, keepPerRow: keep)
     }

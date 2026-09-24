@@ -132,6 +132,68 @@ public final class BatchSpeculativeGenerator {
         self.firstTokens = anchors
     }
 
+    /// One prompt per row: each row's prefilled single-row cache, the state
+    /// its prompt forward returned (with the prompt's tapped hidden states),
+    /// its last-position logits and its prompt tokens.
+    public struct RowPrompt {
+        public var cache: [KVCache]
+        public var promptState: LMOutput.State
+        public var lastLogits: MLXArray
+        public var promptTokens: MLXArray
+        public init(cache: [KVCache], promptState: LMOutput.State, lastLogits: MLXArray, promptTokens: MLXArray) {
+            self.cache = cache
+            self.promptState = promptState
+            self.lastLogits = lastLogits
+            self.promptTokens = promptTokens
+        }
+    }
+
+    /// Rows with different prompts ("experts"): every row is prefilled on
+    /// its own and the rows are merged into one ragged batch.
+    public init(
+        target: any RaggedSpeculativeTarget, drafter: DFlashDraftModel, rows prompts: [RowPrompt],
+        parameters: GenerateParameters, eosTokens: Set<Int>, options: Options = Options()
+    ) {
+        precondition(!prompts.isEmpty)
+        self.target = target
+        self.drafter = drafter
+        self.sampler = parameters.sampler()
+        self.samples = parameters.temperature != 0
+        self.eosTokens = eosTokens
+        self.options = options
+        self.blockSize = max(2, min(options.blockSize, drafter.maximumBlockSize ?? options.blockSize))
+
+        var firsts: [Int] = []
+        var draftStates: [[KVCache]] = []
+        for prompt in prompts {
+            let hidden = prompt.promptState[mtpLastHiddenStatesKey]!
+            let logits = prompt.lastLogits.reshaped(1, -1)
+            let first = samples
+                ? sampler.sample(distribution: sampler.distribution(logits: logits)!)
+                : argMax(logits, axis: -1)
+            eval(first)
+            firsts.append(first.asArray(Int.self)[0])
+            var drafterState = drafter.makeState(parameters: parameters)
+            drafter.prepareDrafterState(
+                target: target, promptTokens: prompt.promptTokens, targetHidden: hidden,
+                firstBonus: first[0 ..< 1], positionDeltas: nil, state: &drafterState, sampler: sampler)
+            draftStates.append(drafterState.cache)
+        }
+        anchors = firsts
+        draftCaches = drafter.mergedCaches(draftStates)
+        cache = target.mergeCaches(prompts.map(\.cache))
+        // Rope deltas and other per-row state: rows prefilled alone carry
+        // their own; text prompts have none, so the first row's state
+        // stands for the batch.
+        var state = prompts[0].promptState
+        state[mtpLastHiddenStatesKey] = nil
+        self.state = state
+        rowIDs = Array(prompts.indices)
+        positions = prompts.map { $0.promptState[mtpLastHiddenStatesKey]!.dim(1) }
+        produced = Array(repeating: 0, count: prompts.count)
+        firstTokens = firsts
+    }
+
     public var isFinished: Bool { rowIDs.isEmpty }
 
     /// One round for every active row. Returns what each row produced.
