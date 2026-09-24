@@ -885,6 +885,18 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel, OnlineAdap
         return argMax(logits, axis: -1)
     }
 
+    /// Extend a single-row drafter context with the target's tapped hidden
+    /// states for positions `start ..< start + n` (a shared transcript that
+    /// grew by `n` tokens).
+    public func extendContext(_ targetHidden: MLXArray, start: Int, caches: [KVCache]) {
+        appendContext(targetHidden, start: start, caches: caches)
+    }
+
+    /// Fresh single-row context caches for this draft.
+    public func makeContextCaches() -> [KVCache] {
+        makeState(parameters: nil).cache
+    }
+
     // MARK: Ragged rows
 
     /// Draft `blockSize - 1` tokens after each row's anchor `[B, 1]`, rows

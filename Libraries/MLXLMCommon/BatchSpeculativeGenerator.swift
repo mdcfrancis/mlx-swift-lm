@@ -140,6 +140,36 @@ public final class BatchSpeculativeGenerator {
         self.firstTokens = anchors
     }
 
+    /// Rows expanded from a shared single-row state whose drafter context
+    /// already exists (a resident transcript): no first tokens are drawn —
+    /// the caller appends each row's own tail with `append(_:)`, which
+    /// draws them from the tail's last position.
+    public init(
+        target: any RaggedSpeculativeTarget, drafter: DFlashDraftModel,
+        sharedCache: [KVCache], sharedDraftCaches: [KVCache], sharedState: LMOutput.State, sharedLength: Int,
+        rows: Int, parameters: GenerateParameters, eosTokens: Set<Int>, options: Options = Options()
+    ) {
+        precondition(rows >= 1)
+        self.target = target
+        self.drafter = drafter
+        self.sampler = parameters.sampler()
+        self.samples = parameters.temperature != 0
+        self.eosTokens = eosTokens
+        self.options = options
+        self.blockSize = max(2, min(options.blockSize, drafter.maximumBlockSize ?? options.blockSize))
+        draftCaches = drafter.expandedCaches(sharedDraftCaches, rows: rows)
+        cache = target.expandCache(sharedCache, rows: rows)
+        var state = sharedState
+        state[mtpLastHiddenStatesKey] = nil
+        self.state = state
+        rowIDs = Array(0 ..< rows)
+        positions = Array(repeating: sharedLength, count: rows)
+        anchors = Array(repeating: 0, count: rows)
+        produced = Array(repeating: 0, count: rows)
+        totalRows = rows
+        firstTokens = nil
+    }
+
     /// One prompt per row: each row's prefilled single-row cache, the state
     /// its prompt forward returned (with the prompt's tapped hidden states),
     /// its last-position logits and its prompt tokens.
