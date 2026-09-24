@@ -23,6 +23,10 @@ public final class BatchSpeculativeGenerator {
         public var maxTokens = 400
         /// Time each stage of a round (adds synchronisation; profiling only).
         public var timing = false
+        /// Keep a finished row's caches (trimmed to what it emitted) so
+        /// `append(_:)` can give it more tokens later, instead of dropping
+        /// the row for good.
+        public var keepFinishedRows = false
         public init() {}
     }
 
@@ -61,6 +65,9 @@ public final class BatchSpeculativeGenerator {
     public private(set) var report = Report()
     /// Each row's first token, emitted with its first round.
     private var firstTokens: [Int]?
+    /// Finished rows kept aside (`keepFinishedRows`), by original row.
+    private var parked: [Int: (cache: [KVCache], draft: [KVCache], position: Int)] = [:]
+    private var totalRows: Int
     /// Milliseconds per stage, summed over rounds (with `timing`).
     public private(set) var stageMilliseconds: [String: Double] = [:]
     private var stageClock = ContinuousClock.now
@@ -129,6 +136,7 @@ public final class BatchSpeculativeGenerator {
         rowIDs = Array(0 ..< rows)
         positions = Array(repeating: promptLength, count: rows)
         produced = Array(repeating: 0, count: rows)
+        totalRows = rows
         self.firstTokens = anchors
     }
 
@@ -191,10 +199,82 @@ public final class BatchSpeculativeGenerator {
         rowIDs = Array(prompts.indices)
         positions = prompts.map { $0.promptState[mtpLastHiddenStatesKey]!.dim(1) }
         produced = Array(repeating: 0, count: prompts.count)
+        totalRows = prompts.count
         firstTokens = firsts
     }
 
     public var isFinished: Bool { rowIDs.isEmpty }
+
+    /// Give every row (active or parked) more prompt tokens — the next
+    /// turn of a conversation — in one ragged prefill, and make every row
+    /// active again with a fresh token budget. `suffixes` is indexed by
+    /// original row and must be non-empty for every row.
+    public func append(_ suffixes: [[Int]]) {
+        precondition(suffixes.count == totalRows, "append needs one suffix per row")
+        precondition(suffixes.allSatisfy { !$0.isEmpty }, "append needs a non-empty suffix for every row")
+        // Gather every row as a single-row cache, in original order.
+        var rowCaches = [[KVCache]?](repeating: nil, count: totalRows)
+        var rowDrafts = [[KVCache]?](repeating: nil, count: totalRows)
+        var rowPositions = [Int](repeating: 0, count: totalRows)
+        for (r, id) in rowIDs.enumerated() {
+            rowCaches[id] = target.extractRow(cache, row: r)
+            rowDrafts[id] = drafter.extractRow(draftCaches, row: r)
+            rowPositions[id] = positions[r]
+        }
+        for (id, entry) in parked {
+            rowCaches[id] = entry.cache
+            rowDrafts[id] = entry.draft
+            rowPositions[id] = entry.position
+        }
+        precondition(rowCaches.allSatisfy { $0 != nil }, "append: a row is neither active nor parked")
+        parked.removeAll()
+        cache = target.mergeCaches(rowCaches.map { $0! })
+        draftCaches = drafter.mergedCaches(rowDrafts.map { $0! })
+        rowIDs = Array(0 ..< totalRows)
+        positions = rowPositions
+        let B = totalRows
+
+        // One forward over the padded suffixes at each row's positions;
+        // the padding is dropped again like rejected drafts.
+        let longest = suffixes.map(\.count).max()!
+        let padded = suffixes.map { $0 + Array(repeating: $0.last!, count: longest - $0.count) }
+        let tokens = MLXArray(padded.flatMap { $0.map { Int32($0) } }).reshaped(B, longest)
+        let rowPositionIds = MLXArray(positions.map { Int32($0) }).reshaped(B, 1)
+            + MLXArray(Int32(0) ..< Int32(longest)).reshaped(1, longest)
+        var prefillState = state
+        prefillState[mtpEmitFlagKey] = true
+        prefillState[mtpTapLayersKey] = drafter.targetTapLayers
+        prefillState[mtpSpeculativeTapeKey] = true
+        prefillState[mtpPositionIdsKey] = rowPositionIds
+        let result = target(LMInput.Text(tokens: tokens), cache: cache, state: prefillState)
+        guard let taps = result.state?[mtpLastHiddenStatesKey] else {
+            fatalError("BatchSpeculativeGenerator: the target did not emit tapped hidden states")
+        }
+        var nextState = result.state ?? state
+        nextState[mtpLastHiddenStatesKey] = nil
+        nextState[mtpEmitFlagKey] = nil
+        nextState[mtpSpeculativeTapeKey] = nil
+        nextState[mtpPositionIdsKey] = nil
+        state = nextState
+
+        let keep = suffixes.map(\.count)
+        target.rewindSpeculativeCache(cache, keepPerRow: keep)
+        drafter.commitRagged(taps, keep: keep, starts: positions, caches: draftCaches)
+
+        // Each row's next token comes from its own last real position.
+        let lastIndex = MLXArray(keep.map { Int32($0 - 1) }).reshaped(B, 1, 1)
+        let lastLogits = takeAlong(result.logits, broadcast(lastIndex, to: [B, 1, result.logits.dim(-1)]), axis: 1)
+            .squeezed(axis: 1)
+        let first = samples
+            ? sampler.sample(distribution: sampler.distribution(logits: lastLogits)!)
+            : argMax(lastLogits, axis: -1)
+        eval(first, cache.flatMap { $0.innerState() })
+        anchors = first.asArray(Int.self)
+        firstTokens = anchors
+        positions = zip(positions, keep).map { $0 + $1 }
+        produced = Array(repeating: 0, count: B)
+        report.rounds += 0
+    }
 
     /// One round for every active row. Returns what each row produced.
     public func round() -> [Emission] {
@@ -274,21 +354,19 @@ public final class BatchSpeculativeGenerator {
         }
 
         lap("accept")
-        // Rewind each row to what it keeps, and let the draft see it.
-        let keep = accepted.map { $0 + 1 }
-        target.rewindSpeculativeCache(cache, keepPerRow: keep)
-        if options.timing { eval(cache.flatMap { $0.innerState() }) }
-        lap("rewind")
-        drafter.commitRagged(taps, keep: keep, starts: positions, caches: draftCaches)
-        lap("commit")
-
-        // Emit, and retire rows that finished.
+        // What each row emits, and how much of the pass it keeps: a row
+        // that finishes (end token, or its budget) keeps only what it
+        // emitted, so its cache ends exactly where its text does.
         var emissions: [Emission] = []
         var survivors: [Int] = []
+        var keep = accepted.map { $0 + 1 }
         let first = firstTokens
         firstTokens = nil
+        var finishedRows: [Int] = []
         for r in 0 ..< B {
-            var tokens = (first.map { [$0[r]] } ?? []) + (0 ..< accepted[r]).map { proposed[r * drafts + $0] } + [finals[r]]
+            let lead = first.map { [$0[r]] } ?? []
+            let fresh = (0 ..< accepted[r]).map { proposed[r * drafts + $0] } + [finals[r]]
+            var tokens = lead + fresh
             var finished = false
             if let end = tokens.firstIndex(where: { eosTokens.contains($0) }) {
                 tokens = Array(tokens[..<end])
@@ -299,11 +377,29 @@ public final class BatchSpeculativeGenerator {
                 tokens = Array(tokens.prefix(max(0, room)))
                 finished = true
             }
+            if finished {
+                // Positions of this pass the row keeps: its emitted share
+                // of `fresh` (the lead token was already in the cache).
+                keep[r] = max(0, tokens.count - lead.count)
+                finishedRows.append(r)
+            }
             produced[r] += tokens.count
             emissions.append(Emission(row: rowIDs[r], tokens: tokens, finished: finished))
             if !finished { survivors.append(r) }
+        }
+        target.rewindSpeculativeCache(cache, keepPerRow: keep)
+        if options.timing { eval(cache.flatMap { $0.innerState() }) }
+        lap("rewind")
+        drafter.commitRagged(taps, keep: keep, starts: positions, caches: draftCaches)
+        lap("commit")
+        for r in 0 ..< B {
             positions[r] += keep[r]
             anchors[r] = finals[r]
+        }
+        if options.keepFinishedRows {
+            for r in finishedRows {
+                parked[rowIDs[r]] = (target.extractRow(cache, row: r), drafter.extractRow(draftCaches, row: r), positions[r])
+            }
         }
         report.rounds += 1
         report.blockTotal += blockSize

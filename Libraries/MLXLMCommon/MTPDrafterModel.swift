@@ -408,6 +408,8 @@ public protocol RaggedSpeculativeTarget: DFlashTargetModel {
     func expandCache(_ cache: [KVCache], rows: Int) -> [KVCache]
     /// Rows from single-row caches at different lengths (one prompt each).
     func mergeCaches(_ rows: [[KVCache]]) -> [KVCache]
+    /// One row of a batched cache as single-row caches.
+    func extractRow(_ cache: [KVCache], row: Int) -> [KVCache]
     /// After a taped verify pass of `L` positions, keep `keep[r]` of them
     /// in row `r` (attention entries trimmed, recurrent state replayed).
     func rewindSpeculativeCache(_ cache: [KVCache], keepPerRow keep: [Int])

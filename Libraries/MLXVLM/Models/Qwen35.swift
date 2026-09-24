@@ -1616,6 +1616,20 @@ extension Qwen35: RaggedSpeculativeTarget {
         }
     }
 
+    public func extractRow(_ cache: [KVCache], row: Int) -> [KVCache] {
+        cache.map { entry -> KVCache in
+            if let mamba = entry as? MambaCache {
+                let single = MambaCache()
+                single[0] = mamba[0].map { $0[row ..< (row + 1)] }
+                single[1] = mamba[1].map { $0[row ..< (row + 1)] }
+                single.offset = mamba.offset
+                return single
+            }
+            if let ragged = entry as? RaggedKVCache { return ragged.extract(row: row) }
+            preconditionFailure("extractRow needs ragged attention caches")
+        }
+    }
+
     public func rewindSpeculativeCache(_ cache: [KVCache], keepPerRow keep: [Int]) {
         languageModel.model.rewindSpeculativeCache(cache, keepPerRow: keep)
     }

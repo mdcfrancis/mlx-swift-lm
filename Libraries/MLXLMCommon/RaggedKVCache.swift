@@ -156,6 +156,18 @@ public final class RaggedKVCache: BaseKVCache {
         offset = lengths.max() ?? 0
     }
 
+    /// One row as its own single-row cache (its logical length only).
+    public func extract(row: Int) -> RaggedKVCache {
+        let single = RaggedKVCache(rows: 1)
+        let length = lengths[row]
+        single.keys = keys?[row ..< (row + 1), 0..., ..<length, 0...]
+        single.values = values?[row ..< (row + 1), 0..., ..<length, 0...]
+        single.lengths = [length]
+        single.lengthsBeforeLastWrite = [length]
+        single.offset = length
+        return single
+    }
+
     /// Keep only the given rows.
     public func filter(rows kept: [Int]) {
         let index = MLXArray(kept.map { Int32($0) })

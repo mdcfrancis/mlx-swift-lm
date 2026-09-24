@@ -225,20 +225,37 @@ public final class DFlashContextCache: BaseKVCache {
         rowPositions = rowPositions?[index]
     }
 
+    /// One row of a batched cache as a single-row cache.
+    func extract(row: Int) -> DFlashContextCache {
+        let single = DFlashContextCache(sinkSize: sinkSize, windowSize: windowSize)
+        single.keys = keys?[row ..< (row + 1)]
+        single.values = values?[row ..< (row + 1)]
+        if let rowPositions {
+            single.rowPositions = rowPositions[row ..< (row + 1)]
+        } else {
+            single.positions = positions
+        }
+        single.offset = offset
+        return single
+    }
+
+    /// Entries this row holds (uniform or per-row bookkeeping).
+    var entryCount: Int { rowPositions?.dim(1) ?? positions.count }
+
     /// Rows from single-row caches with different entry counts; shorter
     /// rows are padded with entries at position -1 (never attended).
     static func merged(_ rows: [DFlashContextCache]) -> DFlashContextCache {
         precondition(!rows.isEmpty)
         let new = DFlashContextCache(sinkSize: rows[0].sinkSize, windowSize: rows[0].windowSize)
-        let longest = rows.map(\.length).max() ?? 0
+        let longest = rows.map(\.entryCount).max() ?? 0
         var keyRows: [MLXArray] = []
         var valueRows: [MLXArray] = []
         var positionRows: [MLXArray] = []
         for row in rows {
-            let pad = longest - row.length
+            let pad = longest - row.entryCount
             var k = row.keys ?? MLXArray.zeros([1, 1, 0, 1])
             var v = row.values ?? MLXArray.zeros([1, 1, 0, 1])
-            var p = MLXArray(row.positions)
+            var p = row.rowPositions?.reshaped(-1) ?? MLXArray(row.positions)
             if pad > 0 {
                 k = concatenated([k, MLXArray.zeros([1, k.dim(1), pad, k.dim(3)], dtype: k.dtype)], axis: 2)
                 v = concatenated([v, MLXArray.zeros([1, v.dim(1), pad, v.dim(3)], dtype: v.dtype)], axis: 2)
@@ -922,6 +939,10 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel, OnlineAdap
         return (0 ..< rows[0].count).map { layer in
             DFlashContextCache.merged(rows.map { $0[layer] as! DFlashContextCache })
         }
+    }
+
+    func extractRow(_ caches: [KVCache], row: Int) -> [KVCache] {
+        caches.map { ($0 as? DFlashContextCache)?.extract(row: row) ?? $0 }
     }
 
     func filterCaches(_ caches: [KVCache], rows: [Int]) {
