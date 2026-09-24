@@ -167,8 +167,62 @@ public final class DFlashContextCache: BaseKVCache {
 
     public var length: Int { positions.count }
 
+    /// Per-row absolute positions `[B, N]` (Int32, -1 = no entry) once the
+    /// cache serves rows at different lengths; nil while every row shares
+    /// `positions`.
+    public private(set) var rowPositions: MLXArray?
+
     public override func innerState() -> [MLXArray] {
-        [keys, values].compactMap { $0 }
+        [keys, values, rowPositions].compactMap { $0 }
+    }
+
+    /// Every row starts as a copy of this single-row cache.
+    public func expanded(rows: Int) -> DFlashContextCache {
+        let new = DFlashContextCache(sinkSize: sinkSize, windowSize: windowSize)
+        new.keys = keys.map { repeated($0, count: rows, axis: 0) }
+        new.values = values.map { repeated($0, count: rows, axis: 0) }
+        new.positions = positions
+        new.rowPositions = repeated(MLXArray(positions).reshaped(1, -1), count: rows, axis: 0)
+        new.offset = offset
+        return new
+    }
+
+    /// Append `n` entries per row, valid where `positions[r, j] >= 0`. The
+    /// window is applied on physical columns, so rows that committed fewer
+    /// entries keep marginally less history; their positions stay exact.
+    func appendRagged(keys newKeys: MLXArray, values newValues: MLXArray, positions newPositions: MLXArray) {
+        let n = newKeys.dim(2)
+        guard n > 0 else { return }
+        var rowPositions = self.rowPositions ?? repeated(MLXArray(positions).reshaped(1, -1), count: newKeys.dim(0), axis: 0)
+        if let keys, let values {
+            self.keys = concatenated([keys, newKeys], axis: 2)
+            self.values = concatenated([values, newValues], axis: 2)
+        } else {
+            keys = newKeys
+            values = newValues
+        }
+        rowPositions = concatenated([rowPositions, newPositions.asType(.int32)], axis: 1)
+        let total = rowPositions.dim(1)
+        let limit = sinkSize + windowSize
+        if total > limit, let keys, let values {
+            let sink = 0 ..< sinkSize
+            let window = (total - windowSize) ..< total
+            self.keys = concatenated([keys[0..., 0..., sink], keys[0..., 0..., window]], axis: 2)
+            self.values = concatenated([values[0..., 0..., sink], values[0..., 0..., window]], axis: 2)
+            rowPositions = concatenated([rowPositions[0..., sink], rowPositions[0..., window]], axis: 1)
+        }
+        self.rowPositions = rowPositions
+        positions = []
+        eval(rowPositions)
+        offset = Int(rowPositions.max().item(Int32.self)) + 1
+    }
+
+    /// Keep only the given rows.
+    func filter(rows: [Int]) {
+        let index = MLXArray(rows.map { Int32($0) })
+        keys = keys?[index]
+        values = values?[index]
+        rowPositions = rowPositions?[index]
     }
 
     public override var state: [MLXArray] {
@@ -303,6 +357,52 @@ final class DFlashAttention: Module {
         k = rope(k, offset: start)
         let v = vProj(context).reshaped(B, n, kvHeads, headDim).transposed(0, 2, 1, 3)
         return (k, v)
+    }
+
+    /// Context keys and values for rows whose entries start at their own
+    /// absolute positions `[B]`.
+    func contextKeysValues(_ context: MLXArray, rowStarts: MLXArray) -> (MLXArray, MLXArray) {
+        let (B, n) = (context.dim(0), context.dim(1))
+        var k = kNorm(kProj(context).reshaped(B, n, kvHeads, headDim)).transposed(0, 2, 1, 3)
+        k = rope(k, offset: rowStarts)
+        let v = vProj(context).reshaped(B, n, kvHeads, headDim).transposed(0, 2, 1, 3)
+        return (k, v)
+    }
+
+    /// Ragged attention: row `r`'s block starts at `queryOffsets[r]` over
+    /// its own context entries (`cache.rowPositions`).
+    func callAsFunction(_ x: MLXArray, cache: DFlashContextCache, queryOffsets: MLXArray) -> MLXArray {
+        let (B, L) = (x.dim(0), x.dim(1))
+        var q = qNorm(qProj(x).reshaped(B, L, heads, headDim)).transposed(0, 2, 1, 3)
+        q = rope(q, offset: queryOffsets)
+        var k = kNorm(kProj(x).reshaped(B, L, kvHeads, headDim)).transposed(0, 2, 1, 3)
+        k = rope(k, offset: queryOffsets)
+        let v = vProj(x).reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
+
+        let blockPositions = queryOffsets.reshaped(B, 1) + MLXArray(Int32(0) ..< Int32(L)).reshaped(1, L)
+        var keys = k
+        var values = v
+        var keyPositions = blockPositions
+        if let cachedKeys = cache.keys, let cachedValues = cache.values, let cachedPositions = cache.rowPositions {
+            keys = concatenated([cachedKeys, k], axis: 2)
+            values = concatenated([cachedValues, v], axis: 2)
+            keyPositions = concatenated([cachedPositions, blockPositions], axis: 1)
+        }
+        // [B, 1, L, N+L]: valid context within the window, plus the block.
+        let queries = blockPositions.reshaped(B, 1, L, 1)
+        let keysArray = keyPositions.reshaped(B, 1, 1, -1)
+        let starts = queryOffsets.reshaped(B, 1, 1, 1)
+        var context = (keysArray .>= 0) .&& (keysArray .< starts)
+        if let window {
+            context = context .&& ((queries - keysArray) .< Int32(window))
+        }
+        var block = keysArray .>= starts
+        if isCausal {
+            block = block .&& (keysArray .<= queries)
+        }
+        let output = MLXFast.scaledDotProductAttention(
+            queries: q, keys: keys, values: values, scale: scale, mask: .array(context .|| block))
+        return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, heads * headDim))
     }
 
     /// Attention for a block of `L` positions starting at absolute
@@ -448,6 +548,18 @@ final class DFlashDecoderLayer: Module {
             return h + mlpConv.finish(mlp(normed2), dynamic: dynamic2)
         }
         h = h + attention(inputLayerNorm(h), cache: cache, queryOffset: queryOffset)
+        return h + mlp(postAttentionLayerNorm(h))
+    }
+
+    func callAsFunction(_ x: MLXArray, cache: DFlashContextCache, queryOffsets: MLXArray) -> MLXArray {
+        var h = x
+        if let attentionConv, let mlpConv {
+            let (normed, dynamic) = attentionConv.prepare(inputLayerNorm(h))
+            h = h + attentionConv.finish(attention(normed, cache: cache, queryOffsets: queryOffsets), dynamic: dynamic)
+            let (normed2, dynamic2) = mlpConv.prepare(postAttentionLayerNorm(h))
+            return h + mlpConv.finish(mlp(normed2), dynamic: dynamic2)
+        }
+        h = h + attention(inputLayerNorm(h), cache: cache, queryOffsets: queryOffsets)
         return h + mlp(postAttentionLayerNorm(h))
     }
 }
@@ -724,6 +836,58 @@ public final class DFlashDraftModel: Module, StatefulMTPDrafterModel, OnlineAdap
             return selector.select(hidden: hidden, logits: logits, anchor: anchor)
         }
         return argMax(logits, axis: -1)
+    }
+
+    // MARK: Ragged rows
+
+    /// Draft `blockSize - 1` tokens after each row's anchor `[B, 1]`, rows
+    /// sitting at their own positions.
+    func draftRagged(anchor: MLXArray, target: any DFlashTargetModel, caches: [KVCache], queryOffsets: [Int], blockSize: Int) -> MLXArray {
+        let B = anchor.dim(0)
+        let masks = MLXArray.full([B, blockSize - 1], values: MLXArray(Int32(configuration.dflash.maskTokenId)))
+        let tokens = concatenated([anchor.asType(.int32), masks], axis: 1)
+        var h = target.dflashTokenEmbedding(tokens)
+        let scale = target.dflashEmbeddingScale * (configuration.dflash.inputEmbeddingScale ?? 1)
+        if scale != 1 { h = h * scale }
+        let offsets = MLXArray(queryOffsets.map { Int32($0) })
+        for (layer, entry) in zip(layers, caches) {
+            guard let cache = entry as? DFlashContextCache else { continue }
+            h = layer(h, cache: cache, queryOffsets: offsets)
+        }
+        let hidden = norm(h)[0..., 1..., 0...]
+        let logits = target.dflashLogits(hidden)
+        if let selector {
+            return selector.select(hidden: hidden, logits: logits, anchor: anchor)
+        }
+        return argMax(logits, axis: -1)
+    }
+
+    /// Commit the first `keep[r]` positions of `targetHidden` `[B, L, H]`
+    /// for row `r`, which start at `starts[r]`.
+    func commitRagged(_ targetHidden: MLXArray, keep: [Int], starts: [Int], caches: [KVCache]) {
+        let B = targetHidden.dim(0)
+        let n = keep.max() ?? 0
+        guard n > 0 else { return }
+        let context = projectContext(targetHidden[0..., ..<n, 0...])
+        let keepArray = MLXArray(keep.map { Int32($0) }).reshaped(B, 1)
+        let startArray = MLXArray(starts.map { Int32($0) })
+        let offsets = MLXArray(Int32(0) ..< Int32(n)).reshaped(1, n)
+        let positions = MLX.where(offsets .< keepArray, startArray.reshaped(B, 1) + offsets, MLXArray(Int32(-1)))
+        for (layer, entry) in zip(layers, caches) {
+            guard let cache = entry as? DFlashContextCache else { continue }
+            let (k, v) = layer.attention.contextKeysValues(context, rowStarts: startArray)
+            cache.appendRagged(keys: k, values: v, positions: positions)
+        }
+        eval(caches.flatMap { $0.innerState() })
+    }
+
+    /// The single-row drafter state's caches expanded to `rows` rows.
+    func expandedCaches(_ caches: [KVCache], rows: Int) -> [KVCache] {
+        caches.map { ($0 as? DFlashContextCache)?.expanded(rows: rows) ?? $0 }
+    }
+
+    func filterCaches(_ caches: [KVCache], rows: [Int]) {
+        for entry in caches { (entry as? DFlashContextCache)?.filter(rows: rows) }
     }
 
     // MARK: Debug hooks

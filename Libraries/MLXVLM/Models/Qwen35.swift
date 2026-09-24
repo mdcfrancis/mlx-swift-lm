@@ -631,6 +631,36 @@ enum Qwen35Language {
             return outProj(gated.reshaped(B, S, -1))
         }
 
+        /// Per-row variant: row `r` keeps `keep[r]` of the taped positions.
+        /// The recurrence replays every position with a mask, so a masked
+        /// step leaves the row's state untouched; the conv state is gathered
+        /// per row at its own boundary.
+        func replaySpeculativeTape(cache: MambaCache, keepPerRow keep: [Int]) {
+            guard let tape = cache.speculativeTape else { return }
+            let ops = tape.operands
+            let S = tape.positions
+            let B = keep.count
+            var recurrent = tape.stateBefore.count > 1 ? tape.stateBefore[1] : nil
+            let keepArray = MLXArray(keep.map { Int32($0) }).reshaped(B, 1)
+            var mask = MLXArray(Int32(0) ..< Int32(S)).reshaped(1, S) .< keepArray
+            if let original = ops["mask"] { mask = mask .&& original }
+            let (_, replayed) = gatedDeltaUpdate(
+                q: ops["q"]!, k: ops["k"]!, v: ops["v"]!, a: ops["a"]!, b: ops["b"]!,
+                aLog: aLog, dtBias: dtBias, state: recurrent, mask: mask)
+            recurrent = replayed
+            let convInput = ops["convInput"]!
+            let convState: MLXArray?
+            if convKernelSize > 1 {
+                let width = convKernelSize - 1
+                let index = keepArray.reshaped(B, 1, 1) + MLXArray(Int32(0) ..< Int32(width)).reshaped(1, width, 1)
+                convState = contiguous(
+                    takeAlong(convInput, broadcast(index, to: [B, width, convInput.dim(2)]), axis: 1))
+            } else {
+                convState = tape.stateBefore.first ?? nil
+            }
+            cache.restoreFromSpeculativeTape(keep: keep.max() ?? 0, convState: convState, recurrentState: recurrent)
+        }
+
         /// Restore `cache` to the state before its taped pass plus the first
         /// `keep` positions, replaying the recurrence over the tape.
         func replaySpeculativeTape(cache: MambaCache, keep: Int) {
@@ -855,6 +885,23 @@ enum Qwen35Language {
                 return parts.count == 1 ? parts[0] : concatenated(parts, axis: -1)
             }
             return (applyFinalNorm ? norm(hiddenStates) : hiddenStates, taps)
+        }
+
+        /// Per-row rewind after a taped verify pass over ragged caches: row
+        /// `r` keeps `keep[r]` of the pass's positions.
+        func rewindSpeculativeCache(_ cache: [KVCache], keepPerRow keep: [Int]) {
+            var restored: [MLXArray] = []
+            for (index, entry) in cache.enumerated() {
+                if let mamba = entry as? MambaCache {
+                    layers[index].linearAttn!.replaySpeculativeTape(cache: mamba, keepPerRow: keep)
+                    restored.append(contentsOf: mamba.innerState())
+                } else if let ragged = entry as? RaggedKVCache {
+                    ragged.rewind(keep: keep)
+                } else {
+                    preconditionFailure("rewindSpeculativeCache(keepPerRow:) needs ragged attention caches")
+                }
+            }
+            eval(restored)
         }
 
         /// Rewind `numTokens` positions of a taped verify pass: attention
@@ -1408,13 +1455,28 @@ public class Qwen35: Module, VLMModel {
             faCacheOffset(cache ?? []) == 0 || state?[ropeDeltasKey] != nil,
             "Qwen35 cannot continue a warm prompt cache without \(ropeDeltasKey.id)")
         let typedCache = castCacheOptional(cache)
+        // A batched caller whose rows sit at different lengths supplies
+        // the rotary positions itself.
+        var positionIds = state?[mtpPositionIdsKey]
+        if var provided = positionIds {
+            // Absolute text positions; a prompt with images shifts them by
+            // the rope deltas the prefill recorded.
+            if let deltas = state?[ropeDeltasKey] {
+                var delta = deltas.asType(.int32)
+                if delta.ndim == 0 { delta = delta.reshaped(1) }
+                provided = provided + delta.reshaped(-1, 1)
+            }
+            positionIds = provided.ndim == 2
+                ? broadcast(provided[.newAxis], to: [3, provided.dim(0), provided.dim(1)])
+                : provided
+        }
         let result = languageModel(
             input.tokens,
             inputsEmbeds: nil,
             cache: typedCache,
             state: state,
             mask: nil,
-            positionIds: nil,
+            positionIds: positionIds,
             pixelValues: nil,
             imageGridTHW: nil,
             videoGridTHW: nil
@@ -1508,6 +1570,38 @@ extension Qwen35: SpeculativeCacheRewindModel {
 
     public func rewindSpeculativeCache(_ cache: [KVCache], numTokens: Int) -> Int {
         languageModel.model.rewindSpeculativeCache(cache, numTokens: numTokens)
+    }
+}
+
+extension Qwen35: RaggedSpeculativeTarget {
+    public func expandCache(_ cache: [KVCache], rows: Int) -> [KVCache] {
+        cache.map { entry -> KVCache in
+            if let mamba = entry as? MambaCache {
+                let expanded = MambaCache()
+                expanded[0] = mamba[0].map { repeated($0, count: rows, axis: 0) }
+                expanded[1] = mamba[1].map { repeated($0, count: rows, axis: 0) }
+                expanded.offset = mamba.offset
+                return expanded
+            }
+            if entry is RaggedKVCache { return entry.copy() }
+            precondition(entry.maxSize == nil, "ragged batching needs unbounded attention caches")
+            return RaggedKVCache(expanding: entry, rows: rows)
+        }
+    }
+
+    public func rewindSpeculativeCache(_ cache: [KVCache], keepPerRow keep: [Int]) {
+        languageModel.model.rewindSpeculativeCache(cache, keepPerRow: keep)
+    }
+
+    public func filterCache(_ cache: [KVCache], rows: [Int]) {
+        let index = MLXArray(rows.map { Int32($0) })
+        for entry in cache {
+            if let mamba = entry as? MambaCache {
+                mamba.filter(batchIndices: index)
+            } else if let ragged = entry as? RaggedKVCache {
+                ragged.filter(rows: rows)
+            }
+        }
     }
 }
 

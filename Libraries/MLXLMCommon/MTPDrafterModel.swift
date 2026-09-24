@@ -394,6 +394,31 @@ public let mtpTapLayersKey = LMOutput.Key<[Int]>("mtp.tapLayers")
 /// (``SpeculativeCacheRewindModel/rewindSpeculativeCache(_:numTokens:)``).
 public let mtpSpeculativeTapeKey = LMOutput.Key<Bool>("mtp.recordSpeculativeTape")
 
+/// Explicit rotary positions for a batched forward whose rows sit at
+/// different lengths (`[3, B, L]` for a multimodal-rope model, or
+/// `[B, L]`); set by ``BatchSpeculativeGenerator``.
+public let mtpPositionIdsKey = LMOutput.Key<MLXArray>("mtp.positionIds")
+
+/// A target that can run a batch of rows at different lengths over shared
+/// physical caches: expand a single-row cache into rows, take positions
+/// from ``mtpPositionIdsKey``, and rewind each row by its own amount after
+/// a verify pass.
+public protocol RaggedSpeculativeTarget: DFlashTargetModel {
+    /// Every row starts as a copy of the single-row `cache`.
+    func expandCache(_ cache: [KVCache], rows: Int) -> [KVCache]
+    /// After a taped verify pass of `L` positions, keep `keep[r]` of them
+    /// in row `r` (attention entries trimmed, recurrent state replayed).
+    func rewindSpeculativeCache(_ cache: [KVCache], keepPerRow keep: [Int])
+    /// Drop every row not in `rows`.
+    func filterCache(_ cache: [KVCache], rows: [Int])
+    /// End-of-sequence token ids the target's configuration declares.
+    var raggedBatchLimit: Int { get }
+}
+
+extension RaggedSpeculativeTarget {
+    public var raggedBatchLimit: Int { 16 }
+}
+
 /// Requests a recurrent-cache checkpoint after this many verification input
 /// tokens. Hybrid Qwen models use `1` for MTP-1 so a rejected draft restores
 /// state after the always-committed bonus token without replaying the model.
