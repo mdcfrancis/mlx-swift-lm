@@ -147,7 +147,8 @@ public final class BatchSpeculativeGenerator {
     public init(
         target: any RaggedSpeculativeTarget, drafter: DFlashDraftModel,
         sharedCache: [KVCache], sharedDraftCaches: [KVCache], sharedState: LMOutput.State, sharedLength: Int,
-        rows: Int, parameters: GenerateParameters, eosTokens: Set<Int>, options: Options = Options()
+        rows: Int, parameters: GenerateParameters, eosTokens: Set<Int>, options: Options = Options(),
+        positionBase: Int? = nil
     ) {
         precondition(rows >= 1)
         self.target = target
@@ -163,7 +164,10 @@ public final class BatchSpeculativeGenerator {
         state[mtpLastHiddenStatesKey] = nil
         self.state = state
         rowIDs = Array(0 ..< rows)
-        positions = Array(repeating: sharedLength, count: rows)
+        // Rows continue at the shared prefix's logical position, which is
+        // its length unless the attention caches were windowed (evicted
+        // entries still count; their keys carry their rotary phase).
+        positions = Array(repeating: positionBase ?? sharedLength, count: rows)
         anchors = Array(repeating: 0, count: rows)
         produced = Array(repeating: 0, count: rows)
         totalRows = rows

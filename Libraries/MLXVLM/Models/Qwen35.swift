@@ -1451,8 +1451,11 @@ public class Qwen35: Module, VLMModel {
     public func callAsFunction(
         _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
+        // A warm cache needs the rope deltas its prefill recorded, unless
+        // the caller supplies absolute positions itself (a restored or
+        // batched cache), in which case there is nothing to shift.
         precondition(
-            faCacheOffset(cache ?? []) == 0 || state?[ropeDeltasKey] != nil,
+            faCacheOffset(cache ?? []) == 0 || state?[ropeDeltasKey] != nil || state?[mtpPositionIdsKey] != nil,
             "Qwen35 cannot continue a warm prompt cache without \(ropeDeltasKey.id)")
         let typedCache = castCacheOptional(cache)
         // A batched caller whose rows sit at different lengths supplies

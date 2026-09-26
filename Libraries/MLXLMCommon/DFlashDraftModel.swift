@@ -165,6 +165,22 @@ public final class DFlashContextCache: BaseKVCache {
         super.init()
     }
 
+    /// The single-row contents for a snapshot: keys, values and positions.
+    public func snapshotArrays() -> [MLXArray]? {
+        guard let keys, let values else { return nil }
+        return [keys, values, MLXArray(positions)]
+    }
+
+    /// Adopt snapshot contents into a fresh single-row cache.
+    public func restore(snapshot arrays: [MLXArray]) {
+        guard arrays.count == 3 else { return }
+        keys = arrays[0]
+        values = arrays[1]
+        positions = arrays[2].asArray(Int32.self)
+        rowPositions = nil
+        offset = (positions.max().map { Int($0) } ?? -1) + 1
+    }
+
     public var length: Int { positions.count }
 
     /// Per-row absolute positions `[B, N]` (Int32, -1 = no entry) once the
