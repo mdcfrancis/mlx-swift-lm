@@ -181,9 +181,29 @@ public protocol QuantizedKVCacheProtocol: KVCache {
 }
 
 /// Base cache implementation providing default behaviors
+/// A learned per-head logit bias on a range of physical cache columns, such
+/// as memory slots that replaced evicted context. `attentionWithCacheUpdate`
+/// adds `bias[h]` to query head `h`'s scores for columns
+/// `start ..< start + count`: 0 attends to those columns as ordinary
+/// entries, a large negative bias hides them.
+public struct SlotGate {
+    public var start: Int
+    public var count: Int
+    /// One value per query head.
+    public var bias: MLXArray
+
+    public init(start: Int, count: Int, bias: MLXArray) {
+        self.start = start
+        self.count = count
+        self.bias = bias
+    }
+}
+
 open class BaseKVCache: KVCache {
     public var offset: Int = 0
     public var maxSize: Int? { nil }
+    /// Optional logit bias on a column range; see `SlotGate`.
+    public var slotGate: SlotGate?
 
     /// RoPE offset for this cache. `open` so subclasses can return a non-scalar
     /// offset (e.g. a batched cache's per-row `.batch(...)`).
@@ -529,6 +549,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         if !s.isEmpty {
             new.state = s.map { $0[.ellipsis] }
         }
+        new.slotGate = self.slotGate
         return new
     }
 

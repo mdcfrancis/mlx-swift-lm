@@ -2,7 +2,6 @@
 
 import Foundation
 import MLX
-import MLXFast
 
 /// A key/value cache for a batch of sequences that share a prefix and then
 /// diverge by different amounts per round — the shape batched speculative
@@ -48,6 +47,7 @@ public final class RaggedKVCache: BaseKVCache {
         lengths = Array(repeating: length, count: rows)
         lengthsBeforeLastWrite = lengths
         offset = length
+        slotGate = (single as? BaseKVCache)?.slotGate
     }
 
     /// Rows from single-row caches of different lengths, each placed at
@@ -77,6 +77,7 @@ public final class RaggedKVCache: BaseKVCache {
         lengths = rowLengths
         lengthsBeforeLastWrite = rowLengths
         offset = longest
+        slotGate = (singles.first as? BaseKVCache)?.slotGate
     }
 
     public var rows: Int { lengths.count }
@@ -165,6 +166,7 @@ public final class RaggedKVCache: BaseKVCache {
         single.lengths = [length]
         single.lengthsBeforeLastWrite = [length]
         single.offset = length
+        single.slotGate = slotGate
         return single
     }
 
@@ -202,6 +204,7 @@ public final class RaggedKVCache: BaseKVCache {
         new.lengthsBeforeLastWrite = lengthsBeforeLastWrite
         new.offset = offset
         new.step = step
+        new.slotGate = slotGate
         return new
     }
 }
