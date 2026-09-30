@@ -199,11 +199,33 @@ public struct SlotGate {
     }
 }
 
+/// Records the queries one attention layer sees (after rotary encoding),
+/// keeping the last `keep` positions across calls. Set it on a cache before a
+/// prefill to learn what the new text attends with, e.g. to read an external
+/// memory by relevance.
+public final class QueryTap {
+    public let keep: Int
+    /// [B, query heads, <= keep, head dim].
+    public private(set) var queries: MLXArray?
+
+    public init(keep: Int) {
+        self.keep = keep
+    }
+
+    public func record(_ newQueries: MLXArray) {
+        let joined = queries.map { concatenated([$0, newQueries], axis: 2) } ?? newQueries
+        let count = joined.dim(2)
+        queries = count > keep ? joined[.ellipsis, (count - keep)..., 0...] : joined
+    }
+}
+
 open class BaseKVCache: KVCache {
     public var offset: Int = 0
     public var maxSize: Int? { nil }
     /// Optional logit bias on a column range; see `SlotGate`.
     public var slotGate: SlotGate?
+    /// Optional query recorder; see `QueryTap`. Not carried by `copy()`.
+    public var queryTap: QueryTap?
 
     /// RoPE offset for this cache. `open` so subclasses can return a non-scalar
     /// offset (e.g. a batched cache's per-row `.batch(...)`).

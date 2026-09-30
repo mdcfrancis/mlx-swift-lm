@@ -51,6 +51,9 @@ public func attentionWithCacheUpdate(
             mask: mask
         )
     }
+    if let tap = (cache as? BaseKVCache)?.queryTap {
+        tap.record(queries)
+    }
     if let turboCache = cache as? TurboQuantKVCache {
         let L = queries.dim(2)
         if L > 1 && !turboCache.isCompressed {
