@@ -27,6 +27,9 @@ public final class BatchSpeculativeGenerator {
         /// `append(_:)` can give it more tokens later, instead of dropping
         /// the row for good.
         public var keepFinishedRows = false
+        /// Record the entropy of the target's distribution at every verified
+        /// position (`lastEntropy`): how unsure the model was.
+        public var trackEntropy = false
         public init() {}
     }
 
@@ -239,6 +242,20 @@ public final class BatchSpeculativeGenerator {
 
     public var isFinished: Bool { rowIDs.isEmpty }
 
+    /// With `Options.trackEntropy`: per row of the last round (in its row
+    /// order), the entropy (nats) of the target's next-token distribution at
+    /// each verified position — position j predicts the token after the
+    /// j-th verified token.
+    public private(set) var lastEntropy: [[Float]] = []
+
+    /// The target's caches, one row per active row (to read or refresh
+    /// between rounds, e.g. a region recalled from an external memory).
+    public var targetCaches: [KVCache] { cache }
+    /// The rows still generating, in cache row order (ids as in `Emission`).
+    public var activeRows: [Int] { rowIDs }
+    /// Each active row's next logical position.
+    public var rowPositions: [Int] { positions }
+
     /// Give every row (active or parked) more prompt tokens — the next
     /// turn of a conversation — in one ragged prefill, and make every row
     /// active again with a fresh token budget. `suffixes` is indexed by
@@ -337,6 +354,13 @@ public final class BatchSpeculativeGenerator {
         let logits = result.logits
         if options.timing { eval(logits) }
         lap("verify")
+        if options.trackEntropy {
+            let logp = logits.asType(.float32) - logSumExp(logits.asType(.float32), axis: -1, keepDims: true)
+            let entropy = -(exp(logp) * logp).sum(axis: -1)  // [B, block]
+            let flat = entropy.asArray(Float.self)
+            let width = entropy.dim(1)
+            lastEntropy = (0 ..< B).map { r in Array(flat[(r * width) ..< ((r + 1) * width)]) }
+        }
         guard let taps = result.state?[mtpLastHiddenStatesKey] else {
             fatalError("BatchSpeculativeGenerator: the target did not emit tapped hidden states")
         }

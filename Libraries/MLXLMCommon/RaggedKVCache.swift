@@ -149,6 +149,20 @@ public final class RaggedKVCache: BaseKVCache {
         }
     }
 
+    /// Replace the entries at physical columns `start ..< start + m` with
+    /// `newKeys` / `newValues` ([rows or 1, heads, m, dim]), every row's
+    /// lengths unchanged: a fixed-size region of the prefix (entries recalled
+    /// from an external memory) refreshed between rounds.
+    public func overwrite(from start: Int, keys newKeys: MLXArray, values newValues: MLXArray) {
+        guard let keys, let values else { return }
+        let m = newKeys.dim(2)
+        precondition(start >= 0 && start + m <= (lengths.min() ?? 0), "RaggedKVCache: overwrite past a row's end")
+        let k = broadcast(newKeys.asType(keys.dtype), to: [rows, keys.dim(1), m, keys.dim(3)])
+        let v = broadcast(newValues.asType(values.dtype), to: [rows, values.dim(1), m, values.dim(3)])
+        self.keys = concatenated([keys[.ellipsis, ..<start, 0...], k, keys[.ellipsis, (start + m)..., 0...]], axis: 2)
+        self.values = concatenated([values[.ellipsis, ..<start, 0...], v, values[.ellipsis, (start + m)..., 0...]], axis: 2)
+    }
+
     /// Keep `keep[r]` of the positions the last `update` wrote for row `r`
     /// and drop the rest (the rejected drafts).
     public func rewind(keep: [Int]) {
