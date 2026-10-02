@@ -26,6 +26,25 @@ import MLXNN
 /// instance. Drafters that need their own per-stream state additionally
 /// conform to ``StatefulMTPDrafterModel``.
 public protocol MTPDrafterModel: BaseLanguageModel {
+    /// Decoder-layer outputs (0-based layer indices) the drafter conditions
+    /// on. When set, the target publishes their concatenation for every
+    /// position under ``mtpLastHiddenStatesKey`` instead of its final
+    /// normalised state (DFlash-style drafters); nil keeps the final state.
+    var targetTapLayers: [Int]? { get }
+
+    /// The drafter's prompt conditioning covers the whole context, so when a
+    /// generation starts from a warm cache whose incoming state carries the
+    /// cached prefix's hidden states (``mtpLastHiddenStatesKey``), the
+    /// iterator hands the drafter those plus the new prompt's, not just the
+    /// new prompt's. False keeps prompt tokens and hidden states aligned.
+    var consumesFullContextHidden: Bool { get }
+
+    /// The block size to use for the next round, given how many drafted
+    /// tokens the target accepted this round and the widest block allowed.
+    /// The default keeps the current size; a drafter whose block can vary
+    /// (DFlash) trades draft width against verify cost from recent acceptance.
+    func nextBlockSize(afterAccepting accepted: Int, current: Int, maximum: Int) -> Int
+
     /// Largest total verification block the drafter can produce efficiently.
     /// `nil` means the caller may choose any block size.
     var maximumBlockSize: Int? { get }
@@ -85,6 +104,9 @@ public protocol MTPDrafterModel: BaseLanguageModel {
 }
 
 extension MTPDrafterModel {
+    public var targetTapLayers: [Int]? { nil }
+    public var consumesFullContextHidden: Bool { false }
+    public func nextBlockSize(afterAccepting accepted: Int, current: Int, maximum: Int) -> Int { current }
     public var maximumBlockSize: Int? { nil }
     public var requiresSharedTargetKV: Bool { true }
     public var requiresPromptPrefill: Bool { false }
@@ -98,6 +120,19 @@ extension MTPDrafterModel {
 /// select an in-place path whose recurrent checkpoint is too shallow.
 public protocol SpeculativeCacheRewindModel {
     var maximumNativeTargetCacheRewind: Int { get }
+
+    /// Rewind the last `numTokens` positions of a hybrid cache after a
+    /// speculative verify pass that recorded a tape (``mtpSpeculativeTapeKey``).
+    /// Attention entries trim; recurrent entries are restored to the state
+    /// before the pass and the kept positions replayed. Returns the number of
+    /// positions rewound; the default handles the one-token checkpoint only.
+    func rewindSpeculativeCache(_ cache: [KVCache], numTokens: Int) -> Int
+}
+
+extension SpeculativeCacheRewindModel {
+    public func rewindSpeculativeCache(_ cache: [KVCache], numTokens: Int) -> Int {
+        rewindSpeculativePromptCache(cache, numTokens: numTokens)
+    }
 }
 
 /// Per-stream state for MTP drafters that need their own transient storage.
@@ -296,6 +331,97 @@ public let mtpPositionDeltasKey =
 /// ``mtpLastHiddenStatesKey`` and ``mtpSharedKVStatesKey``. An absent key
 /// reads as `false` (no emit), so non-MTP callers are unaffected.
 public let mtpEmitFlagKey = LMOutput.Key<Bool>("mtp.emitDrafterState")
+
+/// How a speculative generation runs its rounds.
+public struct SpeculativeOptions: Sendable {
+    /// Tokens per round: one bonus plus `blockSize - 1` drafted. Clamped to
+    /// what the drafter and the cache allow.
+    public var blockSize = 4
+    /// Let the drafter re-choose the block each round from recent acceptance
+    /// (``MTPDrafterModel/nextBlockSize(afterAccepting:current:maximum:)``).
+    public var adaptiveBlock = true
+    /// Row counts the target's ``SpeculativeVerifyKernels`` serve. A verify
+    /// pass is padded up to the smallest one that fits when the padding is
+    /// less than half of it (2 rows stay 2; 3 become 4; 9-16 become 16);
+    /// padding rows are rolled back like rejected drafts. Empty: verify
+    /// exactly the round's tokens.
+    public var verifyRowMultiples: [Int] = []
+
+    /// The width a verify pass of `rows` tokens runs at under this policy.
+    public func verifyRows(for rows: Int) -> Int {
+        guard let width = verifyRowMultiples.sorted().first(where: { $0 >= rows }), rows * 2 > width else { return rows }
+        return width
+    }
+    /// Let a drafter that can (``OnlineAdaptingDrafter``) learn from each
+    /// verify pass what the target actually chose.
+    public var onlineLearning = false
+    /// Called after every round with what happened in it.
+    public var observer: (@Sendable (SpeculativeRoundReport) -> Void)?
+    /// Measure each stage of a round (adds synchronisation points; for
+    /// profiling only).
+    public var timing = false
+
+    public init() {}
+}
+
+/// A drafter that adapts itself online from verify passes.
+public protocol OnlineAdaptingDrafter: AnyObject {
+    /// Asked once per round, before the targets are gathered (a device
+    /// sync): whether this round should train.
+    func wantsLearningStep(accepted: Int, drafted: Int) -> Bool
+    /// `targets` are the target's tokens at the drafted positions of the
+    /// round just verified, `accepted` how many drafts it kept.
+    func learn(targets: [Int], accepted: Int, drafted: Int)
+}
+
+/// One speculative round as seen by ``SpeculativeOptions/observer``.
+public struct SpeculativeRoundReport: Sendable {
+    public var round: Int
+    public var blockSize: Int
+    public var drafted: Int
+    public var accepted: Int
+    public var verifiedRows: Int
+    /// Wall milliseconds per stage when ``SpeculativeOptions/timing`` is on.
+    public var stageMilliseconds: [String: Double]?
+}
+
+/// Iterator asks the target which decoder-layer outputs to publish under
+/// ``mtpLastHiddenStatesKey`` (see ``MTPDrafterModel/targetTapLayers``).
+public let mtpTapLayersKey = LMOutput.Key<[Int]>("mtp.tapLayers")
+
+/// Iterator asks the target to record, for this call, what a recurrent
+/// layer needs to restore any prefix of the call's positions afterwards
+/// (``SpeculativeCacheRewindModel/rewindSpeculativeCache(_:numTokens:)``).
+public let mtpSpeculativeTapeKey = LMOutput.Key<Bool>("mtp.recordSpeculativeTape")
+
+/// Explicit rotary positions for a batched forward whose rows sit at
+/// different lengths (`[3, B, L]` for a multimodal-rope model, or
+/// `[B, L]`); set by ``BatchSpeculativeGenerator``.
+public let mtpPositionIdsKey = LMOutput.Key<MLXArray>("mtp.positionIds")
+
+/// A target that can run a batch of rows at different lengths over shared
+/// physical caches: expand a single-row cache into rows, take positions
+/// from ``mtpPositionIdsKey``, and rewind each row by its own amount after
+/// a verify pass.
+public protocol RaggedSpeculativeTarget: DFlashTargetModel {
+    /// Every row starts as a copy of the single-row `cache`.
+    func expandCache(_ cache: [KVCache], rows: Int) -> [KVCache]
+    /// Rows from single-row caches at different lengths (one prompt each).
+    func mergeCaches(_ rows: [[KVCache]]) -> [KVCache]
+    /// One row of a batched cache as single-row caches.
+    func extractRow(_ cache: [KVCache], row: Int) -> [KVCache]
+    /// After a taped verify pass of `L` positions, keep `keep[r]` of them
+    /// in row `r` (attention entries trimmed, recurrent state replayed).
+    func rewindSpeculativeCache(_ cache: [KVCache], keepPerRow keep: [Int])
+    /// Drop every row not in `rows`.
+    func filterCache(_ cache: [KVCache], rows: [Int])
+    /// End-of-sequence token ids the target's configuration declares.
+    var raggedBatchLimit: Int { get }
+}
+
+extension RaggedSpeculativeTarget {
+    public var raggedBatchLimit: Int { 16 }
+}
 
 /// Requests a recurrent-cache checkpoint after this many verification input
 /// tokens. Hybrid Qwen models use `1` for MTP-1 so a rejected draft restores

@@ -198,9 +198,51 @@ public protocol KVCacheAttentionProtocol: KVCache {
 }
 
 /// Base cache implementation providing default behaviors
+/// A learned per-head logit bias on a range of physical cache columns, such
+/// as memory slots that replaced evicted context. `attentionWithCacheUpdate`
+/// adds `bias[h]` to query head `h`'s scores for columns
+/// `start ..< start + count`: 0 attends to those columns as ordinary
+/// entries, a large negative bias hides them.
+public struct SlotGate {
+    public var start: Int
+    public var count: Int
+    /// One value per query head.
+    public var bias: MLXArray
+
+    public init(start: Int, count: Int, bias: MLXArray) {
+        self.start = start
+        self.count = count
+        self.bias = bias
+    }
+}
+
+/// Records the queries one attention layer sees (after rotary encoding),
+/// keeping the last `keep` positions across calls. Set it on a cache before a
+/// prefill to learn what the new text attends with, e.g. to read an external
+/// memory by relevance.
+public final class QueryTap {
+    public let keep: Int
+    /// [B, query heads, <= keep, head dim].
+    public private(set) var queries: MLXArray?
+
+    public init(keep: Int) {
+        self.keep = keep
+    }
+
+    public func record(_ newQueries: MLXArray) {
+        let joined = queries.map { concatenated([$0, newQueries], axis: 2) } ?? newQueries
+        let count = joined.dim(2)
+        queries = count > keep ? joined[.ellipsis, (count - keep)..., 0...] : joined
+    }
+}
+
 open class BaseKVCache: KVCache {
     public var offset: Int = 0
     public var maxSize: Int? { nil }
+    /// Optional logit bias on a column range; see `SlotGate`.
+    public var slotGate: SlotGate?
+    /// Optional query recorder; see `QueryTap`. Not carried by `copy()`.
+    public var queryTap: QueryTap?
 
     /// RoPE offset for this cache. `open` so subclasses can return a non-scalar
     /// offset (e.g. a batched cache's per-row `.batch(...)`).
@@ -546,6 +588,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         if !s.isEmpty {
             new.state = s.map { $0[.ellipsis] }
         }
+        new.slotGate = self.slotGate
         return new
     }
 
@@ -1622,6 +1665,54 @@ public class MambaCache: ArraysCache {
 
     package func discardSpeculativeCheckpoint() {
         speculativeCheckpoint = nil
+        speculativeTape = nil
+    }
+
+    /// What a verify pass recorded so the owning layer can restore the state
+    /// after any prefix of the pass's positions: the cache before the pass
+    /// and the per-position operands (keys by the layer's own names).
+    public struct SpeculativeTape {
+        public var stateBefore: [MLXArray?]
+        public var offsetBefore: Int
+        public var leftPaddingBefore: MLXArray?
+        public var lengthsBefore: MLXArray?
+        public var positions: Int
+        public var operands: [String: MLXArray]
+
+        public init(
+            stateBefore: [MLXArray?], offsetBefore: Int, leftPaddingBefore: MLXArray?,
+            lengthsBefore: MLXArray?, positions: Int, operands: [String: MLXArray]
+        ) {
+            self.stateBefore = stateBefore
+            self.offsetBefore = offsetBefore
+            self.leftPaddingBefore = leftPaddingBefore
+            self.lengthsBefore = lengthsBefore
+            self.positions = positions
+            self.operands = operands
+        }
+    }
+
+    public var speculativeTape: SpeculativeTape?
+
+    /// Record the tape for a verify pass of `positions` tokens. `stateBefore`
+    /// is the cache content as the pass found it; the layer calls this before
+    /// it advances the cache.
+    public func recordSpeculativeTape(stateBefore: [MLXArray?], positions: Int, operands: [String: MLXArray]) {
+        speculativeTape = SpeculativeTape(
+            stateBefore: stateBefore, offsetBefore: offset, leftPaddingBefore: leftPadding,
+            lengthsBefore: lengths, positions: positions, operands: operands)
+    }
+
+    /// Put the cache back to the state before the taped pass plus `keep`
+    /// positions, given the replayed conv and recurrent states (mirrors
+    /// ``advance(_:)`` by `keep`).
+    public func restoreFromSpeculativeTape(keep: Int, convState: MLXArray?, recurrentState: MLXArray?) {
+        guard let tape = speculativeTape else { return }
+        cache = [convState, recurrentState]
+        offset = tape.offsetBefore
+        leftPadding = tape.leftPaddingBefore.map { $0 - keep }
+        lengths = tape.lengthsBefore.map { $0 - keep }
+        speculativeTape = nil
     }
 
     public override func copy() -> any KVCache {

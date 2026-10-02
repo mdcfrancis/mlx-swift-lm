@@ -70,7 +70,7 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
     public let maximumBlockSize: Int? = 2
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
-    public let requiresGreedySampling = true
+    public let requiresGreedySampling = false
     private let preconvertedNorms: Bool
 
     @ModuleInfo(key: "mtp") var mtp: Qwen35MTPPredictor
@@ -243,6 +243,19 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
             numExperts: configuration.numExperts,
             shiftNormWeights: !preconvertedNorms
         )
+    }
+
+    /// A pre-converted ("mlx") checkpoint already carries shifted norms.
+    public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray] {
+        if metadata["format"]?.lowercased() == "mlx" {
+            return qwenMTPSanitizeWeights(
+            weights: weights,
+            mtpNumHiddenLayers: configuration.mtpNumHiddenLayers,
+            numExperts: configuration.numExperts,
+            shiftNormWeights: false
+            )
+        }
+        return sanitize(weights: weights)
     }
 
     private func targetEmbeddingAndHead(_ target: any LanguageModel) -> (Embedding, Linear?) {
