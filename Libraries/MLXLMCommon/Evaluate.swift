@@ -451,7 +451,9 @@ public struct TopPSampler: LogitSampler {
         guard topK < vocabularySize else { return logprobs }
         // O(V) partition on negated logprobs so top-k land at [0, topK).
         // Indices at [topK, V) are the tokens to mask out.
-        let maskIndices = argPartition(-logprobs, kth: topK - 1, axis: -1)[0..., topK...]
+        // Slice the vocabulary axis whatever the rank: the batched
+        // speculative verifier passes [rows, positions, vocab].
+        let maskIndices = argPartition(-logprobs, kth: topK - 1, axis: -1)[.ellipsis, topK...]
         return putAlong(logprobs, maskIndices, values: negInf, axis: -1)
     }
 }
