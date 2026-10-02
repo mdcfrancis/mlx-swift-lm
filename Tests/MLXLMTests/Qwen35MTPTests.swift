@@ -229,7 +229,8 @@ struct Qwen35MTPMetalTests {
         let base = MLXArray(0 ..< 4).asType(.int32).reshaped([1, 1, 4])
         let positionIds = broadcast(base, to: [3, 1, 4])
         let expected = model.languageModel.model(
-            tokens, positionIds: positionIds, applyFinalNorm: false)
+            tokens, positionIds: positionIds, applyFinalNorm: false
+        ).hidden
         let normalized = model.languageModel.model.norm(expected)
         var state = LMOutput.State()
         state[mtpEmitFlagKey] = true

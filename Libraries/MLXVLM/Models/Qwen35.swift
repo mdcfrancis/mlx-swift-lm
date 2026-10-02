@@ -598,7 +598,8 @@ public enum Qwen35Language {
             _ inputs: MLXArray,
             mask: MLXArray? = nil,
             cache: MambaCache? = nil,
-            checkpointAfter: Int? = nil
+            checkpointAfter: Int? = nil,
+            recordTape: Bool = false
         ) -> MLXArray {
             let B = inputs.dim(0)
             let S = inputs.dim(1)
@@ -613,6 +614,8 @@ public enum Qwen35Language {
                 convState = MLXArray.zeros(
                     [B, max(0, convKernelSize - 1), convDim], dtype: inputs.dtype)
             }
+            // What a taped verify pass restores from: the cache as found.
+            let stateBefore: [MLXArray?] = [cache?[0], cache?[1]]
 
             if let mask {
                 mixedQKV = MLX.where(mask[.ellipsis, .newAxis], mixedQKV, 0)
@@ -638,6 +641,12 @@ public enum Qwen35Language {
             let kNormed =
                 MLXArray(invScale).asType(dtype)
                 * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+
+            if recordTape, let cache {
+                var operands = ["q": qNormed, "k": kNormed, "v": v, "a": a, "b": b, "convInput": convInput]
+                if let mask { operands["mask"] = mask }
+                cache.recordSpeculativeTape(stateBefore: stateBefore, positions: S, operands: operands)
+            }
 
             let out: MLXArray
             if let split = checkpointAfter, split > 0, split < S {
@@ -704,6 +713,66 @@ public enum Qwen35Language {
 
             let gated = norm(out, gate: z)
             return outProj(gated.reshaped(B, S, -1))
+        }
+
+        /// Per-row variant: row `r` keeps `keep[r]` of the taped positions.
+        /// The recurrence replays every position with a mask, so a masked
+        /// step leaves the row's state untouched; the conv state is gathered
+        /// per row at its own boundary.
+        func replaySpeculativeTape(cache: MambaCache, keepPerRow keep: [Int]) {
+            guard let tape = cache.speculativeTape else { return }
+            let ops = tape.operands
+            let S = tape.positions
+            let B = keep.count
+            var recurrent = tape.stateBefore.count > 1 ? tape.stateBefore[1] : nil
+            let keepArray = MLXArray(keep.map { Int32($0) }).reshaped(B, 1)
+            var mask = MLXArray(Int32(0) ..< Int32(S)).reshaped(1, S) .< keepArray
+            if let original = ops["mask"] { mask = mask .&& original }
+            let (_, replayed) = gatedDeltaUpdate(
+                q: ops["q"]!, k: ops["k"]!, v: ops["v"]!, a: ops["a"]!, b: ops["b"]!,
+                aLog: aLog, dtBias: dtBias, state: recurrent, mask: mask)
+            recurrent = replayed
+            let convInput = ops["convInput"]!
+            let convState: MLXArray?
+            if convKernelSize > 1 {
+                let width = convKernelSize - 1
+                let index = keepArray.reshaped(B, 1, 1) + MLXArray(Int32(0) ..< Int32(width)).reshaped(1, width, 1)
+                convState = contiguous(
+                    takeAlong(convInput, broadcast(index, to: [B, width, convInput.dim(2)]), axis: 1))
+            } else {
+                convState = tape.stateBefore.first ?? nil
+            }
+            cache.restoreFromSpeculativeTape(keep: keep.max() ?? 0, convState: convState, recurrentState: recurrent)
+        }
+
+        /// Restore `cache` to the state before its taped pass plus the first
+        /// `keep` positions, replaying the recurrence over the tape.
+        func replaySpeculativeTape(cache: MambaCache, keep: Int) {
+            guard let tape = cache.speculativeTape else { return }
+            let ops = tape.operands
+            var recurrent = tape.stateBefore.count > 1 ? tape.stateBefore[1] : nil
+            if keep > 0 {
+                let mask = ops["mask"].map { $0[0..., ..<keep] }
+                let (_, replayed) = gatedDeltaUpdate(
+                    q: ops["q"]![0..., ..<keep, 0..., 0...],
+                    k: ops["k"]![0..., ..<keep, 0..., 0...],
+                    v: ops["v"]![0..., ..<keep, 0..., 0...],
+                    a: ops["a"]![0..., ..<keep, 0...],
+                    b: ops["b"]![0..., ..<keep, 0...],
+                    aLog: aLog,
+                    dtBias: dtBias,
+                    state: recurrent,
+                    mask: mask)
+                recurrent = replayed
+            }
+            let convInput = ops["convInput"]!
+            let convState: MLXArray? =
+                convKernelSize > 1
+                ? contiguous(convInput[0..., keep ..< (keep + convKernelSize - 1), 0...])
+                : (tape.stateBefore.first ?? nil)
+            // Left lazy on purpose: the caller evaluates every layer's
+            // restored state in one pass.
+            cache.restoreFromSpeculativeTape(keep: keep, convState: convState, recurrentState: recurrent)
         }
     }
 
@@ -801,13 +870,14 @@ public enum Qwen35Language {
             ssmMask: MLXArray?,
             cache: KVCache?,
             positionIds: MLXArray?,
-            checkpointAfter: Int? = nil
+            checkpointAfter: Int? = nil,
+            recordTape: Bool = false
         ) -> MLXArray {
             let r: MLXArray
             if isLinear {
                 r = linearAttn!(
                     inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache,
-                    checkpointAfter: checkpointAfter)
+                    checkpointAfter: checkpointAfter, recordTape: recordTape)
             } else {
                 r = selfAttn!(
                     inputLayerNorm(x), mask: attentionMask, cache: cache, positionIds: positionIds)
@@ -846,14 +916,17 @@ public enum Qwen35Language {
             cache: [KVCache?]? = nil,
             positionIds: MLXArray? = nil,
             applyFinalNorm: Bool = true,
-            checkpointAfter: Int? = nil
-        ) -> MLXArray {
+            checkpointAfter: Int? = nil,
+            tapLayers: [Int]? = nil,
+            recordTape: Bool = false
+        ) -> (hidden: MLXArray, taps: MLXArray?) {
             var hiddenStates: MLXArray
             if let inputsEmbeds {
                 hiddenStates = inputsEmbeds
             } else {
                 hiddenStates = embedTokens(inputs)
             }
+            var tapped: [Int: MLXArray] = [:]
 
             var cacheArray = cache
             if cacheArray == nil {
@@ -878,11 +951,65 @@ public enum Qwen35Language {
                     ssmMask: layerSSMMask,
                     cache: cacheArray?[index],
                     positionIds: positionIds,
-                    checkpointAfter: checkpointAfter
+                    checkpointAfter: checkpointAfter,
+                    recordTape: recordTape
                 )
+                if let tapLayers, tapLayers.contains(index) {
+                    tapped[index] = hiddenStates
+                }
             }
 
-            return applyFinalNorm ? norm(hiddenStates) : hiddenStates
+            let taps: MLXArray? = tapLayers.flatMap { ids -> MLXArray? in
+                let parts = ids.compactMap { tapped[$0] }
+                guard parts.count == ids.count, !parts.isEmpty else { return nil }
+                return parts.count == 1 ? parts[0] : concatenated(parts, axis: -1)
+            }
+            return (applyFinalNorm ? norm(hiddenStates) : hiddenStates, taps)
+        }
+
+        /// Per-row rewind after a taped verify pass over ragged caches: row
+        /// `r` keeps `keep[r]` of the pass's positions.
+        func rewindSpeculativeCache(_ cache: [KVCache], keepPerRow keep: [Int]) {
+            var restored: [MLXArray] = []
+            for (index, entry) in cache.enumerated() {
+                if let mamba = entry as? MambaCache {
+                    layers[index].linearAttn!.replaySpeculativeTape(cache: mamba, keepPerRow: keep)
+                    restored.append(contentsOf: mamba.innerState())
+                } else if let ragged = entry as? RaggedKVCache {
+                    ragged.rewind(keep: keep)
+                } else {
+                    preconditionFailure("rewindSpeculativeCache(keepPerRow:) needs ragged attention caches")
+                }
+            }
+            eval(restored)
+        }
+
+        /// Rewind `numTokens` positions of a taped verify pass: attention
+        /// entries trim, recurrent entries replay the kept prefix.
+        func rewindSpeculativeCache(_ cache: [KVCache], numTokens: Int) -> Int {
+            guard cache.count == layers.count, numTokens > 0 else { return 0 }
+            for (index, entry) in cache.enumerated() {
+                if let mamba = entry as? MambaCache {
+                    guard let tape = mamba.speculativeTape, tape.positions >= numTokens else { return 0 }
+                    _ = index
+                } else if !entry.isTrimmable || entry.offset < numTokens {
+                    return 0
+                }
+            }
+            var restored: [MLXArray] = []
+            for (index, entry) in cache.enumerated() {
+                if let mamba = entry as? MambaCache {
+                    let keep = mamba.speculativeTape!.positions - numTokens
+                    layers[index].linearAttn!.replaySpeculativeTape(cache: mamba, keep: keep)
+                    restored.append(contentsOf: mamba.innerState())
+                } else {
+                    guard entry.trim(numTokens) == numTokens else {
+                        preconditionFailure("Speculative cache validation and rewind diverged")
+                    }
+                }
+            }
+            eval(restored)
+            return numTokens
         }
     }
 
@@ -1000,13 +1127,15 @@ public enum Qwen35Language {
             }
 
             let emitDrafterState = state[mtpEmitFlagKey] ?? false
-            let preNormHidden = model(
+            let (preNormHidden, taps) = model(
                 inputs,
                 inputsEmbeds: inputsEmbeds,
                 cache: cache,
                 positionIds: positionIds,
                 applyFinalNorm: !emitDrafterState,
-                checkpointAfter: state[mtpCacheCheckpointIndexKey]
+                checkpointAfter: state[mtpCacheCheckpointIndexKey],
+                tapLayers: emitDrafterState ? state[mtpTapLayersKey] : nil,
+                recordTape: state[mtpSpeculativeTapeKey] ?? false
             )
             let hiddenStates = emitDrafterState ? model.norm(preNormHidden) : preNormHidden
 
@@ -1018,7 +1147,9 @@ public enum Qwen35Language {
             }
 
             if emitDrafterState {
-                state[mtpLastHiddenStatesKey] = hiddenStates
+                // A drafter that taps decoder layers gets their concatenation
+                // for every position; the MTP head gets the final state.
+                state[mtpLastHiddenStatesKey] = taps ?? hiddenStates
                 state[mtpSharedKVStatesKey] = qwen35VLMSharedKVState(
                     cache: cache, fullAttentionIndex: model.faIdx)
                 state[mtpSharedKVOffsetsKey] = qwen35VLMSharedKVOffsets(
@@ -1250,7 +1381,7 @@ public class Qwen35: Module, VLMModel {
         {
             return try prepareContinuation(
                 input, inputIds: inputIds2D, cache: cache, cacheOffset: cacheOffset,
-                positionOffset: positionOffset, prefill: prefill)
+                positionOffset: positionOffset, prefill: prefill, state: state)
         }
 
         let (pixelValues, imageFrames, videoFrames, inputEmbeddings) =
@@ -1307,7 +1438,8 @@ public class Qwen35: Module, VLMModel {
         cache: [any KVCache],
         cacheOffset: Int,
         positionOffset: Int,
-        prefill: PrefillParameters
+        prefill: PrefillParameters,
+        state: LMOutput.State? = nil
     ) throws -> PrepareResult {
         let remainderLength = inputIds.dim(-1)
         precondition(remainderLength > 0, "prepareContinuation needs a non-empty remainder")
@@ -1342,13 +1474,26 @@ public class Qwen35: Module, VLMModel {
         // builds window i+1 (same shape as the sibling chunked prefills).
         let typedCache = castCache(cache)
 
+        // A drafter prefill wants the target's hidden states for every
+        // prompt position: carry the request into each chunk and stitch the
+        // chunks' answers together below.
+        var chunkState: LMOutput.State?
+        if let state, state[mtpEmitFlagKey] == true {
+            var requested = LMOutput.State()
+            requested[mtpEmitFlagKey] = true
+            requested[mtpTapLayersKey] = state[mtpTapLayersKey]
+            chunkState = requested
+        }
+        var emittedHidden: [MLXArray] = []
+        var lastEmittedState: LMOutput.State?
+
         /// One forward over `range`, slicing positions and embeddings in lockstep.
         func forward(_ range: Range<Int>) -> LMOutput {
-            languageModel(
+            let output = languageModel(
                 inputIds[0..., range],
                 inputsEmbeds: inputEmbeddings.map { $0[0..., range, 0...] },
                 cache: typedCache,
-                state: nil,
+                state: chunkState,
                 mask: nil,
                 positionIds: positionIds[0..., 0..., range],
                 // Never the pixels: a non-nil value here clears the carried
@@ -1357,6 +1502,11 @@ public class Qwen35: Module, VLMModel {
                 imageGridTHW: nil,
                 videoGridTHW: nil
             )
+            if chunkState != nil, let hidden = output.state?[mtpLastHiddenStatesKey] {
+                emittedHidden.append(hidden)
+                lastEmittedState = output.state
+            }
+            return output
         }
 
         let processed = try prefill.forEachChunk(total: remainderLength) { range in
@@ -1377,27 +1527,51 @@ public class Qwen35: Module, VLMModel {
         // after this remainder `tailCacheOffset = P + remainderLength`, so the
         // delta the tail needs is the offset-frame `getRopeIndex` delta minus
         // `P` (which `getRopeIndex` implicitly counted into `remainderLength`).
-        return .logits(
-            LMOutput(
-                logits: lastLogits,
-                state: QwenVL.continuationResumeState(
-                    ropeDeltas: ropeDeltas, cacheOffset: cacheOffset, key: ropeDeltasKey)))
+        var resumeState = QwenVL.continuationResumeState(
+            ropeDeltas: ropeDeltas, cacheOffset: cacheOffset, key: ropeDeltasKey)
+        if let lastEmittedState, !emittedHidden.isEmpty {
+            resumeState[mtpLastHiddenStatesKey] =
+                emittedHidden.count == 1 ? emittedHidden[0] : concatenated(emittedHidden, axis: 1)
+            resumeState[mtpSharedKVStatesKey] = lastEmittedState[mtpSharedKVStatesKey]
+            resumeState[mtpSharedKVOffsetsKey] = lastEmittedState[mtpSharedKVOffsetsKey]
+            resumeState[mtpSharedKVSourceIndicesKey] = lastEmittedState[mtpSharedKVSourceIndicesKey]
+            resumeState[mtpPositionDeltasKey] = resumeState[ropeDeltasKey]
+        }
+        return .logits(LMOutput(logits: lastLogits, state: resumeState))
     }
 
     public func callAsFunction(
         _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
+        // A warm cache needs the rope deltas its prefill recorded, unless
+        // the caller supplies absolute positions itself (a restored or
+        // batched cache), in which case there is nothing to shift.
         precondition(
-            faCacheOffset(cache ?? []) == 0 || state?[ropeDeltasKey] != nil,
+            faCacheOffset(cache ?? []) == 0 || state?[ropeDeltasKey] != nil || state?[mtpPositionIdsKey] != nil,
             "Qwen35 cannot continue a warm prompt cache without \(ropeDeltasKey.id)")
         let typedCache = castCacheOptional(cache)
+        // A batched caller whose rows sit at different lengths supplies
+        // the rotary positions itself.
+        var positionIds = state?[mtpPositionIdsKey]
+        if var provided = positionIds {
+            // Absolute text positions; a prompt with images shifts them by
+            // the rope deltas the prefill recorded.
+            if let deltas = state?[ropeDeltasKey] {
+                var delta = deltas.asType(.int32)
+                if delta.ndim == 0 { delta = delta.reshaped(1) }
+                provided = provided + delta.reshaped(-1, 1)
+            }
+            positionIds = provided.ndim == 2
+                ? broadcast(provided[.newAxis], to: [3, provided.dim(0), provided.dim(1)])
+                : provided
+        }
         let result = languageModel(
             input.tokens,
             inputsEmbeds: nil,
             cache: typedCache,
             state: state,
             mask: nil,
-            positionIds: nil,
+            positionIds: positionIds,
             pixelValues: nil,
             imageGridTHW: nil,
             videoGridTHW: nil
@@ -1409,7 +1583,10 @@ public class Qwen35: Module, VLMModel {
         MLXArray]
     {
         if metadata["format"]?.lowercased() == "mlx" {
-            return weights
+            // Already in this model's layout. A conversion that kept the
+            // MTP head (its tensors live under `language_model.mtp.`) is
+            // served by the drafter, not this model.
+            return weights.filter { !$0.key.contains("mtp.") }
         }
         return sanitize(weights: weights)
     }
@@ -1485,7 +1662,94 @@ public class Qwen35: Module, VLMModel {
 }
 
 extension Qwen35: SpeculativeCacheRewindModel {
-    public var maximumNativeTargetCacheRewind: Int { 1 }
+    /// One token restores the checkpoint after the bonus token; more replay
+    /// the recorded tape (``mtpSpeculativeTapeKey``).
+    public var maximumNativeTargetCacheRewind: Int { 64 }
+
+    public func rewindSpeculativeCache(_ cache: [KVCache], numTokens: Int) -> Int {
+        languageModel.model.rewindSpeculativeCache(cache, numTokens: numTokens)
+    }
+}
+
+extension Qwen35: RaggedSpeculativeTarget {
+    public func expandCache(_ cache: [KVCache], rows: Int) -> [KVCache] {
+        cache.map { entry -> KVCache in
+            if let mamba = entry as? MambaCache {
+                let expanded = MambaCache()
+                expanded[0] = mamba[0].map { repeated($0, count: rows, axis: 0) }
+                expanded[1] = mamba[1].map { repeated($0, count: rows, axis: 0) }
+                expanded.offset = mamba.offset
+                return expanded
+            }
+            if entry is RaggedKVCache { return entry.copy() }
+            precondition(entry.maxSize == nil, "ragged batching needs unbounded attention caches")
+            return RaggedKVCache(expanding: entry, rows: rows)
+        }
+    }
+
+    public func mergeCaches(_ rows: [[KVCache]]) -> [KVCache] {
+        precondition(!rows.isEmpty)
+        let layers = rows[0].count
+        precondition(rows.allSatisfy { $0.count == layers })
+        return (0 ..< layers).map { layer -> KVCache in
+            let entries = rows.map { $0[layer] }
+            if let first = entries.first as? MambaCache {
+                let mambas = entries.map { $0 as! MambaCache }
+                let merged = MambaCache()
+                // Every row has the same state shapes (fixed-size recurrent
+                // and conv states); a row without state contributes zeros.
+                func stacked(_ index: Int) -> MLXArray? {
+                    let parts = mambas.compactMap { $0[index] }
+                    guard let template = parts.first else { return nil }
+                    return concatenated(
+                        mambas.map { $0[index] ?? MLXArray.zeros(template.shape, dtype: template.dtype) }, axis: 0)
+                }
+                merged[0] = stacked(0)
+                merged[1] = stacked(1)
+                merged.offset = mambas.map(\.offset).max() ?? first.offset
+                return merged
+            }
+            precondition(entries.allSatisfy { $0.maxSize == nil }, "ragged batching needs unbounded attention caches")
+            return RaggedKVCache(merging: entries)
+        }
+    }
+
+    public func extractRow(_ cache: [KVCache], row: Int) -> [KVCache] {
+        cache.map { entry -> KVCache in
+            if let mamba = entry as? MambaCache {
+                let single = MambaCache()
+                single[0] = mamba[0].map { $0[row ..< (row + 1)] }
+                single[1] = mamba[1].map { $0[row ..< (row + 1)] }
+                single.offset = mamba.offset
+                return single
+            }
+            if let ragged = entry as? RaggedKVCache { return ragged.extract(row: row) }
+            preconditionFailure("extractRow needs ragged attention caches")
+        }
+    }
+
+    public func rewindSpeculativeCache(_ cache: [KVCache], keepPerRow keep: [Int]) {
+        languageModel.model.rewindSpeculativeCache(cache, keepPerRow: keep)
+    }
+
+    public func filterCache(_ cache: [KVCache], rows: [Int]) {
+        let index = MLXArray(rows.map { Int32($0) })
+        for entry in cache {
+            if let mamba = entry as? MambaCache {
+                mamba.filter(batchIndices: index)
+            } else if let ragged = entry as? RaggedKVCache {
+                ragged.filter(rows: rows)
+            }
+        }
+    }
+}
+
+extension Qwen35: DFlashTargetModel {
+    public var dflashTokenEmbedding: Embedding { languageModel.model.embedTokens }
+    public func dflashLogits(_ hidden: MLXArray) -> MLXArray {
+        if let lmHead = languageModel.lmHead { return lmHead(hidden) }
+        return languageModel.model.embedTokens.asLinear(hidden)
+    }
 }
 
 extension Array where Element == THW {

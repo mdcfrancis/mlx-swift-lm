@@ -12,6 +12,23 @@ public protocol LogitSampler {
 
     /// Given `logits` produce a new `MLXArray` with the token.
     func sample(logits: MLXArray) -> MLXArray
+
+    /// The probabilities `sample(logits:)` draws from (float32, over the
+    /// last axis, after the sampler's filters and temperature), or nil for
+    /// a sampler that is not a distribution (argmax). Speculative decoding
+    /// verifies drafts against it.
+    func distribution(logits: MLXArray) -> MLXArray?
+
+    /// Draw a token from an explicit distribution over the last axis.
+    func sample(distribution: MLXArray) -> MLXArray
+}
+
+extension LogitSampler {
+    public func distribution(logits: MLXArray) -> MLXArray? { nil }
+
+    public func sample(distribution: MLXArray) -> MLXArray {
+        categorical(log(distribution))
+    }
 }
 
 /// A `LogitProcessor` is an optional visitor of `logits`.
@@ -370,27 +387,39 @@ public struct TopPSampler: LogitSampler {
     }
 
     public func sample(logits: MLXArray) -> MLXArray {
+        withRandomState(randomState) {
+            categorical(filteredLogprobs(logits) * (1 / temp))
+        }
+    }
+
+    public func distribution(logits: MLXArray) -> MLXArray? {
+        softmax(filteredLogprobs(logits) * (1 / temp), axis: -1)
+    }
+
+    public func sample(distribution: MLXArray) -> MLXArray {
+        withRandomState(randomState) {
+            categorical(log(distribution))
+        }
+    }
+
+    /// Log-probabilities with the filters applied in Python mlx-lm order:
+    /// top_p → min_p → top_k.
+    private func filteredLogprobs(_ logits: MLXArray) -> MLXArray {
         var logits = logits
         if logits.dtype == .bfloat16 {
             logits = logits.asType(.float32)
         }
-
-        return withRandomState(randomState) {
-            var logprobs = logSoftmax(logits)
-
-            // Apply filters in Python mlx-lm order: top_p → min_p → top_k.
-            if let topP {
-                logprobs = applyTopP(logprobs, topP: topP)
-            }
-            if let minP {
-                logprobs = applyMinP(logprobs, minP: minP)
-            }
-            if let topK {
-                logprobs = applyTopK(logprobs, topK: topK)
-            }
-
-            return categorical(logprobs * (1 / temp))
+        var logprobs = logSoftmax(logits)
+        if let topP {
+            logprobs = applyTopP(logprobs, topP: topP)
         }
+        if let minP {
+            logprobs = applyMinP(logprobs, minP: minP)
+        }
+        if let topK {
+            logprobs = applyTopK(logprobs, topK: topK)
+        }
+        return logprobs
     }
 
     /// Keep tokens whose cumulative probability exceeds `1 - topP` (nucleus sampling).
@@ -442,6 +471,16 @@ public struct CategoricalSampler: LogitSampler {
     public func sample(logits: MLXArray) -> MLXArray {
         return withRandomState(randomState) {
             categorical(logits * (1 / temp))
+        }
+    }
+
+    public func distribution(logits: MLXArray) -> MLXArray? {
+        softmax(logits.asType(.float32) * (1 / temp), axis: -1)
+    }
+
+    public func sample(distribution: MLXArray) -> MLXArray {
+        withRandomState(randomState) {
+            categorical(log(distribution))
         }
     }
 }
@@ -2095,10 +2134,34 @@ public func generateTokens(
 public func generate(
     input: LMInput,
     cache: [KVCache]? = nil,
+    state: LMOutput.State? = nil,
     parameters: GenerateParameters,
     context: ModelContext,
     mtpDrafter: any MTPDrafterModel,
     blockSize: Int = 4,
+    components: GenerationComponents = .init(),
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    tools: [[String: any Sendable]]? = nil
+) throws -> AsyncStream<Generation> {
+    var options = SpeculativeOptions()
+    options.blockSize = blockSize
+    options.adaptiveBlock = false
+    return try generate(
+        input: input, cache: cache, state: state, parameters: parameters, context: context,
+        mtpDrafter: mtpDrafter, options: options, components: components, wiredMemoryTicket: wiredMemoryTicket,
+        tools: tools)
+}
+
+/// The MTP-drafter variant above with the round policy spelled out in
+/// ``SpeculativeOptions``.
+public func generate(
+    input: LMInput,
+    cache: [KVCache]? = nil,
+    state: LMOutput.State? = nil,
+    parameters: GenerateParameters,
+    context: ModelContext,
+    mtpDrafter: any MTPDrafterModel,
+    options: SpeculativeOptions,
     components: GenerationComponents = .init(),
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     tools: [[String: any Sendable]]? = nil
@@ -2108,8 +2171,9 @@ public func generate(
         mainModel: context.model,
         drafter: mtpDrafter,
         mainCache: cache,
+        state: state,
         parameters: parameters,
-        blockSize: blockSize,
+        options: options,
         components: components
     )
     let (stream, _) = generateLoopTask(
@@ -2146,10 +2210,32 @@ public func generate(
 public func generateTokens(
     input: LMInput,
     cache: [KVCache]? = nil,
+    state: LMOutput.State? = nil,
     parameters: GenerateParameters,
     context: ModelContext,
     mtpDrafter: any MTPDrafterModel,
     blockSize: Int = 4,
+    components: GenerationComponents = .init(),
+    wiredMemoryTicket: WiredMemoryTicket? = nil
+) throws -> AsyncStream<TokenGeneration> {
+    var options = SpeculativeOptions()
+    options.blockSize = blockSize
+    options.adaptiveBlock = false
+    return try generateTokens(
+        input: input, cache: cache, state: state, parameters: parameters, context: context,
+        mtpDrafter: mtpDrafter, options: options, components: components, wiredMemoryTicket: wiredMemoryTicket)
+}
+
+/// The MTP-drafter variant above with the round policy spelled out in
+/// ``SpeculativeOptions``.
+public func generateTokens(
+    input: LMInput,
+    cache: [KVCache]? = nil,
+    state: LMOutput.State? = nil,
+    parameters: GenerateParameters,
+    context: ModelContext,
+    mtpDrafter: any MTPDrafterModel,
+    options: SpeculativeOptions,
     components: GenerationComponents = .init(),
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<TokenGeneration> {
@@ -2158,8 +2244,9 @@ public func generateTokens(
         mainModel: context.model,
         drafter: mtpDrafter,
         mainCache: cache,
+        state: state,
         parameters: parameters,
-        blockSize: blockSize,
+        options: options,
         components: components
     )
     let (stream, _) = generateLoopTask(
